@@ -58,6 +58,16 @@ DENIED / STOP`, and `UNKNOWN_RECONCILE` (explicit resolution required).
   integrity hash; truncation/partial package ⇒ STOP before mutation.
 
 ## 6. Provider adapters (machine-addressable production routes)
+- **Standing setup vs per-transaction authority.** A provider API key is a one-time, owner-entered SETUP
+  (GAOP Setup card → App-private `/data`, 0600, never echoed/logged, deletable). It is not authority.
+  Every consequential transaction still needs exactly one Dashboard Authorize press; there are **no
+  recurring provider "Allow once" prompts** in production.
+- **Production route = provider API** (`claude-api`: Anthropic Messages API; `openai-api`: OpenAI Chat
+  Completions). The App is the executor: claim → provider call → result bound to transaction ID +
+  proposal hash + correlation ID → verify → evidence → COMPLETED. Consumer browser/chat sessions are
+  development/recovery fallback only.
+- Fail closed: not configured / auth / rejected / malformed / binding mismatch → STOP; timeout / network /
+  5xx → UNKNOWN_RECONCILE, never retried blindly. Executors cannot claim or post results for API routes.
 - Contract input: transaction ID, route, payload locator, integrity hash, authorized action ID,
   expiry/idempotency. Output: dispatch ack, claim identity, result locator/hash, receipt/status,
   error/reconcile. Adapters never carry authority.
@@ -84,6 +94,18 @@ DENIED / STOP`, and `UNKNOWN_RECONCILE` (explicit resolution required).
   the existing GAOP root/folder; if inaccessible it STOPs and never creates a duplicate root.
 - Home Assistant backups remain outside GAOP. No generic shell, broad maps, broad OAuth scopes,
   Supervisor/HA/Docker API access, or host network.
+
+## 8a. Drive evidence receipt (v0.7.2)
+- Receipt `gaop.receipt.v2` records: evidence status, file SHA-256, integrity (re-download match),
+  disposition `DELETED` / `RETAINED_DELETE_FAILED` (with delete verification), unrelated-ID denial
+  result (must be denied, otherwise STOP), the existing GAOP root/folder IDs used, and an archive
+  correlation ID. The App never creates a GAOP root or folder.
+
+## 8b. Reconciliation
+- `UNKNOWN_RECONCILE` is resolved only by an explicit `reconcile` envelope to `CANCELLED`, allowed only when
+  no result was persisted and no evidence step ran. The interruption record is preserved and the
+  transaction record is never deleted. (TXN-05R-M2M-0001, the v0.7.0 interrupted-write proof, is reconciled
+  this way in DAI-IN-503.)
 
 ## 9. Failure semantics
 - STOP and UNKNOWN_RECONCILE are explicit, persisted states. There is **no blind retry**; uncertain

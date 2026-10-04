@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.2
+- Live provider adapters (App is the executor for API routes): `claude-api` (Anthropic Messages API)
+  and `openai-api` (OpenAI Chat Completions). After the owner's single Authorize press the App claims,
+  calls the provider, binds the result to transaction ID + proposal hash + correlation ID, verifies,
+  archives evidence and completes — no provider UI and no further prompts.
+  Fail closed: not configured / auth (401/403) / rejected (4xx) / malformed / binding mismatch → STOP;
+  timeout / network / 5xx → UNKNOWN_RECONCILE (no blind retry). Executors cannot claim or submit results
+  for API-route transactions.
+- One-time provider Setup card (owner only): API key stored only in App-private /data (0600), never
+  echoed, logged, or exposed; configured/not-configured status; delete/replace.
+- Receipt v2: provider route/model/response ID/request ID/correlation ID; Drive evidence integrity,
+  disposition (DELETED / RETAINED_DELETE_FAILED), delete verification, unrelated-ID denial result,
+  existing root/folder IDs, archive correlation ID. Unrelated-ID visibility now STOPs the evidence leg.
+- Governed `reconcile` envelope: UNKNOWN_RECONCILE → CANCELLED only when no result was persisted and no
+  evidence step ran; interruption record preserved; transaction record never deleted.
+- Owner request-entry card (synthetic) and Recent results on the Dashboard.
+- Security fix: transaction views expose only the SHA-256 of a claim ID (claim IDs authorise begin/result).
+
 ## 0.7.1
 - Executor control ingress `POST /control` (Supervisor Ingress, same bounded `gaop.control.v1`
   envelope, authority keys still rejected) so envelopes are delivered **without an App restart**.
