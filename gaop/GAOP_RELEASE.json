@@ -1,0 +1,24 @@
+{
+ "build_timestamp": "2026-10-04T17:36:41Z",
+ "gaop_version": "0.7.0",
+ "package_digest": "16d6646f7040595c4314c26f947783a66936a24263da0b810c95a5e1e361826a",
+ "package_files": {
+  "CHANGELOG.md": "b531cceca86efd71fda3656632bfa0368305e9462622f2e01f528831a63ca8af",
+  "DOCS.md": "48453807ad8dfef2db96aad7c2a1637b4223874b893a56c38ab41da743f58897",
+  "Dockerfile": "a14f5b129e0ff795db2c3aa08991e4d131963bcc5db2f78a29301b71650ed8e3",
+  "README.md": "4aa2db4d5ce96ceee64bc92cb1bc1dd10e0b60ec0e772631f4ab1e7a0e4b149a",
+  "apparmor.txt": "91a46beb74ddf87ba666ab502ee4f18f848a1f47a18634487ea410a1a7a68add",
+  "config.yaml": "c33ed6aea34243b45b45745f1e103fab5a496d6236e07e93c5f751edc5b3707b",
+  "gaop_core.py": "e3c7c5b9af5fad899446963b93988d7b56c049005fac140e555c18bfa67e8108",
+  "run.sh": "f775e53ba186bb0886d232e7f1d1211d649ef3d86dbeb46db53b004126933ad4"
+ },
+ "package_schema": "gaop.distribution.v1",
+ "private_source_commit": "ed674b48bdd2d126b055be07f525316c2531e818",
+ "private_source_repo": "SFF2101/home-assistant-gaop",
+ "public_distribution_commit": "recorded in PUBLICATION.json after publication",
+ "runtime_files": {
+  "gaop_core.py": "e3c7c5b9af5fad899446963b93988d7b56c049005fac140e555c18bfa67e8108",
+  "run.sh": "f775e53ba186bb0886d232e7f1d1211d649ef3d86dbeb46db53b004126933ad4"
+ },
+ "schema": "gaop.release.v1"
+}

@@ -1,0 +1,26 @@
+# AppArmor profile for GAOP v0.7.0. Profile name must match the app slug.
+# Least privilege: no extra capabilities beyond file ownership on App-private /data; TCP only
+# (Ingress listener + outbound HTTPS to Google); writes confined to /data, /tmp, /run.
+#include <tunables/global>
+
+profile gaop flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+
+  capability chown,
+  capability fowner,
+  capability dac_override,
+
+  signal (receive) set=(kill,term,int,hup,cont),
+
+  network inet stream,
+  network inet6 stream,
+
+  /** rix,
+  /** mr,
+
+  /data/** rwk,
+  /run/** rwk,
+  /tmp/** rwk,
+  /dev/** rw,
+}
