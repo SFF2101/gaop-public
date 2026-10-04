@@ -1,0 +1,9 @@
+{
+ "gaop_version": "0.7.0",
+ "package_digest": "16d6646f7040595c4314c26f947783a66936a24263da0b810c95a5e1e361826a",
+ "private_source_commit": "ed674b48bdd2d126b055be07f525316c2531e818",
+ "public_distribution_commit": "4a04f27e0eb8ae4500ca91de7b9eed7415612f67",
+ "release_manifest": "gaop/GAOP_RELEASE.json",
+ "rollback_target": "6803297a6d12b095de2b72606f1e63062311575b (pre-GAOP website-only main; no App)",
+ "schema": "gaop.publication.v1"
+}
