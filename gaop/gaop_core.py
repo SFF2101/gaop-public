@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -930,6 +930,22 @@ class Handler(BaseHTTPRequestHandler):
         peer, uid, owner = self._ident()
         path = self.path.split("?")[0].rstrip("/")
         n = int(self.headers.get("Content-Length", "0") or 0)
+        if path == "/control":
+            # Executor control ingress (v0.7.1): same bounded gaop.control.v1 envelope as the
+            # `control_envelope` option, delivered without an App restart. Never an authority
+            # path: envelopes carrying authority-bearing keys are rejected by parse_envelope.
+            if peer != INGRESS_GATEWAY:
+                return self._json(403, {"error": "NOT_INGRESS_GATEWAY"})
+            if n > MAX_ENVELOPE_BYTES:
+                self.rfile.read(min(n, MAX_ENVELOPE_BYTES + 1))
+                log("CONTROL DENIED OVERSIZE (%d bytes)" % n)
+                return self._json(413, {"outcome": "DENIED", "code": "OVERSIZE"})
+            raw = self.rfile.read(n).decode(errors="replace")
+            out = self.engine.apply_envelope(raw)
+            log("CONTROL %s caller=%s %s" % (sha(raw.encode())[:12],
+                "owner" if owner else ("id:" + sha((OWNER_PIN_PREFIX + uid).encode())[:12] if uid else "none"),
+                json.dumps(out, sort_keys=True)))
+            return self._json(200 if out.get("outcome") in ("ACCEPTED", "NOOP") else 409, out)
         if n > 2048:
             return self._json(413, {"error": "OVERSIZE"})
         form = urllib.parse.parse_qs(self.rfile.read(n).decode(errors="replace"))
@@ -960,8 +976,13 @@ class Handler(BaseHTTPRequestHandler):
                 % (d.code, g("txn_id")[:48], owner, peer == INGRESS_GATEWAY))
             return self._send(403, self._panel(owner, notice="DENIED: " + d.code), "text/html")
 
+    def _base(self):
+        b = self.headers.get("X-Ingress-Path", "")
+        return b if re.match(r"^/api/hassio_ingress/[A-Za-z0-9_-]{8,128}$", b) else "."
+
     def _panel(self, owner, notice=""):
         e = self.engine
+        base = esc(self._base())
         rows = []
         for t in e.s.active():
             try:
@@ -974,10 +995,10 @@ class Handler(BaseHTTPRequestHandler):
                 hid = "".join('<input type="hidden" name="%s" value="%s">' % (k, esc(x)) for k, x in (
                     ("txn_id", v["txn_id"]), ("proposal_sha256", v["proposal_sha256"]),
                     ("state_version", v["state_version"]), ("nonce", v["pending_nonce"])))
-                form = ('<form method="post" action="authority">%s'
+                form = ('<form method="post" action="%s/authority">%s'
                         '<button name="decision" value="authorize" class="go">Authorize</button> '
                         '<button name="decision" value="reject">Reject</button> '
-                        '<button name="decision" value="revise">Revise</button></form>' % hid)
+                        '<button name="decision" value="revise">Revise</button></form>' % (base, hid))
             rows.append(
                 '<div class="card"><h3>%s <span class="st">%s</span></h3>'
                 '<p>%s</p><table><tr><td>Operation</td><td>%s</td></tr><tr><td>Target</td><td>%s</td></tr>'
@@ -999,12 +1020,12 @@ class Handler(BaseHTTPRequestHandler):
                      % (st["client_configured"], st["token_present"],
                         ("· scope " + esc(st.get("scope"))) if st.get("scope") else ""))
             if not st["token_present"]:
-                setup += ('<form method="post" action="setup/drive_client">'
+                setup += ('<form method="post" action="%s/setup/drive_client">' % base +
                           '<input name="client_id" placeholder="OAuth client ID (TVs and Limited Input)" size="60"> '
                           '<input name="client_secret" placeholder="client secret" type="password" size="30"> '
                           '<button>Save client</button></form>')
                 if st["client_configured"]:
-                    setup += '<form method="post" action="setup/drive_start"><button>Start Google sign-in</button></form>'
+                    setup += '<form method="post" action="%s/setup/drive_start"><button>Start Google sign-in</button></form>' % base
                 if fl.get("state") == "PENDING":
                     setup += ('<p class="code">Go to <b>%s</b> and enter code <b>%s</b> (same Google account). '
                               'This page updates when approved.</p>'

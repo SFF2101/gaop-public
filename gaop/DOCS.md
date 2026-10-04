@@ -1,4 +1,4 @@
-# GAOP — Governed AI Operations Platform (v0.7.0, durable production generation)
+# GAOP — Governed AI Operations Platform (v0.7.x, durable production generation)
 
 This file is the self-sufficient operating description of the repository-installed GAOP App.
 The earlier local POC App (`local_gaop_gate_a_poc`, v0.6.0) is **retained historical evidence
@@ -44,7 +44,9 @@ DENIED / STOP`, and `UNKNOWN_RECONCILE` (explicit resolution required).
 - Unknown newer store schema fails closed; migration hooks exist for future versions.
 
 ## 4. Bounded control ingress (executors)
-- App option `control_envelope`, protocol `gaop.control.v1`, **≤ 4096 bytes**, secret-free, synthetic
+- Primary route: `POST /control` on the Supervisor Ingress port (no App restart). Fallback: App option
+  `control_envelope` (applied by Supervisor only at App start). Same envelope either way.
+- Protocol `gaop.control.v1`, **≤ 4096 bytes**, secret-free, synthetic
   allowlisted operations only in v0.7.0 (`synthetic.echo`, targets `synthetic:*`).
 - Ops: `propose`, `revise`, `cancel`, `claim`, `begin`, `result`. Malformed, truncated, oversize or
   unsupported-protocol envelopes fail closed.

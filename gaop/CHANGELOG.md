@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1
+- Executor control ingress `POST /control` (Supervisor Ingress, same bounded `gaop.control.v1`
+  envelope, authority keys still rejected) so envelopes are delivered **without an App restart**.
+  v0.7.0 delivered envelopes only via the `control_envelope` option, which Supervisor applies only on
+  restart; a restart correctly reconciles any RUNNING transaction to UNKNOWN_RECONCILE, so the
+  result leg could not complete. The option route remains for boot-time delivery.
+- Owner panel form actions use the Supervisor `X-Ingress-Path` base (fixes 404 after a Setup action).
+
 ## 0.7.0
 - First durable repository-installed generation (slug `gaop`), distributed via `SFF2101/gaop-public`.
 - Safe idle/default: normal start never replays the Gate A/B/C/H or Phase 0.5C harnesses.
