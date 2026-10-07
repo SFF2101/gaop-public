@@ -1,23 +1,23 @@
 {
- "build_timestamp": "2026-10-07T14:33:47Z",
- "gaop_version": "0.8.1",
- "package_digest": "74f4dfd0645479380ae2090e5682760157546e9e27fa7570fae2279079fcd3e6",
+ "build_timestamp": "2026-10-07T19:39:18Z",
+ "gaop_version": "0.8.2",
+ "package_digest": "53ab3cc4307444e7c5204f2cff4d216c5c3e3f536a5b4d8605767d1119cd6eca",
  "package_files": {
-  "CHANGELOG.md": "3387821c36c2096e5cfcadb8aab2dd1c4f0b6e92cc0f46cef78356166e94ea93",
-  "DOCS.md": "853a525de7164886923166a565daa409e6f97d98ce4d4ba04aca2fc351000432",
-  "Dockerfile": "59a274701918133b7474cb7d8a26fc429e0681f0dcf5f5e4203b03f99dd985c1",
+  "CHANGELOG.md": "4aefe3f2d1e5c420d469140a3b635d479b85a830a97a414488a44179b4b76e52",
+  "DOCS.md": "672f0e663de941cc0bf76c1ef1c6b8a8489247fdccd30f9b137ecdea69cf63df",
+  "Dockerfile": "165a8b9a4c5890ace7afc72d7d8a014e19b12a16927e410335aa5a6f0da2826a",
   "README.md": "b4920cc20c336b96918b38f14ba29bbe2985476067385cf6bb4e8594b0ba75e1",
   "apparmor.txt": "91a46beb74ddf87ba666ab502ee4f18f848a1f47a18634487ea410a1a7a68add",
-  "config.yaml": "1139425ebe5088db09297e0ba642063f2ea161280e13c9c0e32c0d84d0e32d0a",
-  "gaop_core.py": "81af6cc4c7b537ea50cc306c518f240fc9f555c2b518c7de0d5f1d2d432b0559",
+  "config.yaml": "86bce1b81bd4de3938ae6177ed0cd385fd6f4ed4a9180a9873ca489fc29efb96",
+  "gaop_core.py": "e31d63c6667f9e754df9469aeeec67b25bd05a68700c7edd1e02e316023a853f",
   "run.sh": "f775e53ba186bb0886d232e7f1d1211d649ef3d86dbeb46db53b004126933ad4"
  },
  "package_schema": "gaop.distribution.v1",
- "private_source_commit": "0b446d8d380ef73f19c2ac83f419d5be3df17157",
+ "private_source_commit": "2cf435980cc5bd052c047544e6258f4f8c24535b",
  "private_source_repo": "SFF2101/home-assistant-gaop",
  "public_distribution_commit": "recorded in PUBLICATION.json after publication",
  "runtime_files": {
-  "gaop_core.py": "81af6cc4c7b537ea50cc306c518f240fc9f555c2b518c7de0d5f1d2d432b0559",
+  "gaop_core.py": "e31d63c6667f9e754df9469aeeec67b25bd05a68700c7edd1e02e316023a853f",
   "run.sh": "f775e53ba186bb0886d232e7f1d1211d649ef3d86dbeb46db53b004126933ad4"
  },
  "schema": "gaop.release.v1"

@@ -1,5 +1,9 @@
 # GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
 
+**v0.8.2 (P1):** besides synthetic operations, GAOP can read exactly `sun.sun` and set exactly
+`input_boolean.gaop_pilot_probe` (Home Assistant Core API only; Supervisor API disabled). See §15 of the
+as-built document.
+
 **v0.8.0:** the canonical as-built description of the production mechanisms (R1 package/authority binding,
 R2 idempotency/checkpoints, R3 capability scoping, budgets, liveness, dual-AI review/disagreement,
 anti-assumption) is `governance/GAOP_PRODUCTION_ARCHITECTURE_AS_BUILT_v1.0.0_2026-10-07.md` in the private
