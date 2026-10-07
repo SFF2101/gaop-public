@@ -12,7 +12,7 @@ COPY GAOP_RELEASE.json /GAOP_RELEASE.json
 RUN chmod a+x /run.sh /gaop_core.py
 
 LABEL \
-  io.hass.version="0.8.2" \
+  io.hass.version="0.8.3" \
   io.hass.type="addon" \
   io.hass.arch="aarch64|amd64"
 

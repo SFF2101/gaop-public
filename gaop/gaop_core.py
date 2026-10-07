@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.2"
+VERSION = "0.8.3"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -1369,6 +1369,7 @@ class Engine:
                 res["after"] = ha.get_state(ent)
         except HAError as he:
             rec["ha"] = {"calls": list(ha.calls), "error": he.kind, "detail": he.detail}
+            log("HA %s %s %s calls=%s" % (txn_id, he.kind, he.detail, json.dumps(ha.calls)))
             wrote = any(c[0] == "POST" for c in ha.calls)
             if he.kind == "UNCERTAIN" and wrote:
                 rec["reconcile"] = {"reason": "HA_WRITE_UNCERTAIN " + he.detail, "at": self.clock()}
@@ -2104,6 +2105,7 @@ class Engine:
         v["receipt_sha256"] = (rec.get("receipt") or {}).get("receipt_sha256")
         v["disagreement"] = rec.get("disagreement")
         v["prior_disagreements"] = rec.get("prior_disagreements") or []
+        v["ha"] = rec.get("ha")
         v["live"] = self.live_view(rec) if "budget" in rec else None
         if owner and rec["state"] in ("AWAITING_AUTHORITY", "DISAGREEMENT"):
             v["pending_nonce"] = rec["pending_nonce"]
@@ -2731,6 +2733,12 @@ def serve():
         except urllib.error.HTTPError as he:
             sp = he.code
         log("BOUNDARY supervisor_api_probe status=%s (%s)" % (sp, "DENIED" if sp in (401, 403) else "NOT DENIED"))
+        try:
+            cst, _ = ha_http("GET", "/", None, 5)
+        except HAError as he:
+            cst = "error:" + he.detail
+        log("BOUNDARY core_api_root_probe status=%s token_present=%s url=%s" % (
+            cst, bool(os.environ.get("SUPERVISOR_TOKEN")), HA_CORE_URL))
     except Exception as ex:
         log("BOUNDARY supervisor_api_probe error=%s (unreachable)" % type(ex).__name__)
     cred = DriveCred(store)
