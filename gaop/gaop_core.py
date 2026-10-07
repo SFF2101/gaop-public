@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAOP v0.8.1 — production dual-AI build (DAI-IN-509): control plane core.
+"""GAOP v0.8.2 — production dual-AI build (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
 
 Single stdlib-only module. Roles (repository-role invariant):
   GitHub private repo = source; gaop-public = generated secret-free distribution;
@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -38,8 +38,14 @@ OWNER_PIN_PREFIX = "gaop.owner-pin.v1:"
 OWNER_PIN = "deb39f6c5eaeb0d19713042adc11435425a59c28f2e41e012411e54839f70361"
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
-ALLOWED_OPS = {"synthetic.echo"}       # synthetic/allowlisted operations only (Phase 0.5R)
-OP_VERSIONS = {"synthetic.echo": "1"}
+ALLOWED_OPS = {"synthetic.echo", "ha.state.read", "ha.input_boolean.set"}
+OP_VERSIONS = {"synthetic.echo": "1", "ha.state.read": "1", "ha.input_boolean.set": "1"}
+# v0.8.2 P1 (DAI-IN-512): exactly two real Home Assistant operations, each bound to exactly one target.
+# There is no generic entity read and no generic service call anywhere in GAOP.
+HA_OP_TARGETS = {"ha.state.read": "ha:sun.sun", "ha.input_boolean.set": "ha:input_boolean.gaop_pilot_probe"}
+HA_OP_ROUTES = {"claude-api"}          # GAOP itself performs the HA call after Claude's bound intent matches
+HA_CORE_URL = os.environ.get("GAOP_HA_URL", "http://supervisor/core/api")
+HA_TIMEOUT = 15
 # v0.8.0 provider-role binding (separation of duties): executor routes implement, reviewer routes
 # design/review. A route may never act in the other role.
 EXECUTOR_ROUTES = {"claude-session", "claude-api", "github-executor", "mock"}
@@ -83,7 +89,13 @@ OP_STAGES = {   # op -> {role: allowed transaction states}; None = transaction m
 FACT_STATUS = {"ACCEPTED_EVIDENCE", "FRESH_OBSERVATION", "INFERENCE", "UNKNOWN", "AUTHORITY",
                "EXECUTION_EVIDENCE", "VERIFICATION_EVIDENCE"}
 ACCEPTANCE_BASIS = {"VERIFICATION_EVIDENCE", "EXECUTION_EVIDENCE", "FRESH_OBSERVATION"}
-VERIFY_PREDICATES = {"echo_equals_value", "bound_txn", "bound_proposal", "bound_package"}
+OP_PREDICATES = {
+    "synthetic.echo": {"echo_equals_value", "bound_txn", "bound_proposal", "bound_package"},
+    "ha.state.read": {"ha_entity_exact", "ha_state_present", "ha_no_write", "bound_txn", "bound_proposal", "bound_package"},
+    "ha.input_boolean.set": {"ha_entity_exact", "ha_after_equals_requested", "ha_single_write",
+                             "bound_txn", "bound_proposal", "bound_package"},
+}
+VERIFY_PREDICATES = set().union(*OP_PREDICATES.values())
 
 # ---- per-transaction budgets (gaop.budget.v1): defaults, and policy ceilings a proposal may not exceed
 BUDGET_KEYS = ("elapsed_s", "provider_calls", "tool_calls", "retrieval_bytes", "input_tokens",
@@ -327,7 +339,7 @@ def build_exec_package(txn_id, revision, p, expires_at, pkg_nonce):
                             "review_route": p.get("review_route", "openai-api"),
                             "evidence": p.get("evidence", "none")},
             "preservation": list(p.get("preserve", [])), "budgets": resolve_budgets(p.get("budgets")),
-            "verification": sorted(p.get("verify", sorted(VERIFY_PREDICATES))),
+            "verification": sorted(p.get("verify", sorted(OP_PREDICATES[p["op"]]))),
             "nonce": pkg_nonce, "expires_at": expires_at, "operation_id": operation_identity(p)}
 
 
@@ -420,9 +432,22 @@ def validate_proposal(p):
     if not isinstance(p.get("preserve", []), list) or len(p.get("preserve", [])) > 5 or \
             any(not isinstance(x, str) or len(x) > 80 for x in p.get("preserve", [])):
         raise Denied("MALFORMED", "preserve")
-    v = p.get("verify", sorted(VERIFY_PREDICATES))
-    if not isinstance(v, list) or not v or set(v) - VERIFY_PREDICATES:
+    v = p.get("verify", sorted(OP_PREDICATES[p["op"]]))
+    if not isinstance(v, list) or not v or set(v) - OP_PREDICATES[p["op"]]:
         raise Denied("MALFORMED", "verify")
+    if p["op"] in HA_OP_TARGETS:
+        # exact target + exact value schema; HA ops only on the App-executed claude-api route
+        if p["target"] != HA_OP_TARGETS[p["op"]]:
+            raise Denied("TARGET_NOT_ALLOWLISTED", str(p["target"])[:60])
+        if p["route"] not in HA_OP_ROUTES:
+            raise Denied("ROUTE_NOT_ALLOWED", "HA ops require claude-api")
+        if p["op"] == "ha.state.read" and p["value"] != {}:
+            raise Denied("MALFORMED", "read takes no value")
+        if p["op"] == "ha.input_boolean.set" and (not isinstance(p["value"], dict) or set(p["value"]) != {"state"}
+                                                   or p["value"]["state"] not in ("on", "off")):
+            raise Denied("MALFORMED", "value must be {state: on|off}")
+        if p.get("evidence", "none") != "none":
+            raise Denied("MALFORMED", "HA ops: evidence none")
     resolve_budgets(p.get("budgets"))
     validate_facts(p.get("facts"))
     if p.get("evidence", "none") not in ("none", "drive"):
@@ -432,7 +457,7 @@ def validate_proposal(p):
     for k in ("target", "scope", "effect", "summary"):
         if not isinstance(p[k], str) or len(p[k]) > 200:
             raise Denied("MALFORMED", k)
-    if not str(p["target"]).startswith("synthetic:"):
+    if p["op"] == "synthetic.echo" and not str(p["target"]).startswith("synthetic:"):
         raise Denied("SCOPE_NOT_SYNTHETIC", "target must be synthetic:")
     return p
 
@@ -539,6 +564,84 @@ def call_provider(route, cred, payload, transport, timeout=PROVIDER_TIMEOUT, max
                           "proposal_sha256": payload["proposal_sha256"],
                           "correlation_id": payload["correlation_id"]}, sort_keys=True))
     return provider_request(route, cred, EXEC_SYSTEM, user, transport, timeout, max_tokens)
+
+
+def call_provider_intent(route, cred, payload, transport, timeout=PROVIDER_TIMEOUT, max_tokens=300):
+    """Claude (implementer) states the exact action for the authorised package; GAOP executes only
+    if the stated intent equals the package-derived action (no regenerated substitute)."""
+    user = ("You are implementing an authorised Home Assistant action. Return exactly this JSON object, "
+            "copying every value unchanged: " + json.dumps(payload, sort_keys=True))
+    return provider_request(route, cred, EXEC_SYSTEM, user, transport, timeout, max_tokens)
+
+
+def expected_ha_intent(pkg):
+    ent = pkg["targets"][0].split(":", 1)[1]
+    if pkg["operation"] == "ha.state.read":
+        return {"action": "read_state", "entity_id": ent}
+    return {"action": "set_state", "entity_id": ent, "desired": pkg["parameters"]["state"]}
+
+
+class HAError(Exception):
+    """kind: DEFINITIVE (request refused/failed, no write happened) | UNCERTAIN (write may have happened)."""
+    def __init__(self, kind, detail=""):
+        super().__init__("%s %s" % (kind, detail))
+        self.kind, self.detail = kind, str(detail)[:120]
+
+
+def ha_http(method, path, body, timeout):
+    tok = os.environ.get("SUPERVISOR_TOKEN", "")
+    req = urllib.request.Request(HA_CORE_URL + path, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"},
+                                 method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read(65537)
+    except urllib.error.HTTPError as e:
+        return e.code, b""
+    except Exception as ex:
+        raise HAError("UNCERTAIN", type(ex).__name__)
+
+
+class HAClient:
+    """The ONLY Home Assistant access in GAOP: a fixed table of exactly three calls. Anything else is
+    refused before any network I/O. calls[] records every request for the ha_no_write/ha_single_write
+    predicates."""
+    CALLS = {
+        ("GET", "/states/sun.sun"),
+        ("GET", "/states/input_boolean.gaop_pilot_probe"),
+        ("POST", "/services/input_boolean/turn_on"),
+        ("POST", "/services/input_boolean/turn_off"),
+    }
+
+    def __init__(self, transport=None):
+        self.t = transport or ha_http
+        self.calls = []
+
+    def _req(self, method, path, body=None):
+        if (method, path) not in self.CALLS:
+            raise Denied("HA_CALL_NOT_ALLOWLISTED", "%s %s" % (method, path))
+        if method == "POST" and body != {"entity_id": "input_boolean.gaop_pilot_probe"}:
+            raise Denied("HA_CALL_NOT_ALLOWLISTED", "service body")
+        self.calls.append([method, path])
+        return self.t(method, path, body, HA_TIMEOUT)
+
+    def get_state(self, entity_id):
+        st, raw = self._req("GET", "/states/" + entity_id)
+        if st != 200:
+            raise HAError("DEFINITIVE", "GET http %d" % st)
+        try:
+            j = json.loads(raw.decode())
+            return {"entity_id": j["entity_id"], "state": j["state"], "last_changed": j.get("last_changed")}
+        except Exception:
+            raise HAError("DEFINITIVE", "malformed state")
+
+    def set_boolean(self, desired):
+        st, _ = self._req("POST", "/services/input_boolean/turn_" + desired, {"entity_id": "input_boolean.gaop_pilot_probe"})
+        if st == 200:
+            return
+        if 400 <= st < 500:
+            raise HAError("DEFINITIVE", "service http %d" % st)
+        raise HAError("UNCERTAIN", "service http %d" % st)
 
 
 def provider_request(route, cred, system, user, transport, timeout=PROVIDER_TIMEOUT, max_tokens=300):
@@ -1148,8 +1251,13 @@ class Engine:
             rec = self.s.put(rec, v)
             v = rec["state_version"]
             # execute the AUTHORISED package (digest-checked above), never a regenerated substitute
-            payload = {"value": pkg["parameters"], "txn_id": txn_id,
-                       "proposal_sha256": rec["proposal_sha256"], "correlation_id": corr}
+            is_ha = pkg["operation"] in HA_OP_TARGETS
+            if is_ha:
+                payload = dict(expected_ha_intent(pkg), txn_id=txn_id, proposal_sha256=rec["proposal_sha256"],
+                               correlation_id=corr)
+            else:
+                payload = {"value": pkg["parameters"], "txn_id": txn_id,
+                           "proposal_sha256": rec["proposal_sha256"], "correlation_id": corr}
             in_tok = len(json.dumps(payload)) // 4 + 60
             self._charge(rec, "input_tokens", in_tok)
             max_out = max(1, min(300, rec["budget"]["limits"]["output_tokens"] - rec["budget"]["used"]["output_tokens"]))
@@ -1162,7 +1270,10 @@ class Engine:
         finally:
             self.s.unlock()
         try:
-            resp, err = call_provider(route, cred, payload, tr, max_tokens=max_out), None
+            if is_ha:
+                resp, err = call_provider_intent(route, cred, payload, tr, max_tokens=max_out), None
+            else:
+                resp, err = call_provider(route, cred, payload, tr, max_tokens=max_out), None
         except ProviderError as pe:
             resp, err = None, pe
         self.s.lock()
@@ -1192,6 +1303,8 @@ class Engine:
                 self._tr(rec, "STOP", "provider output over budget")
                 self.s.put(rec, v)
                 return {"state": "STOP", "provider": "OVER_BUDGET"}
+            if is_ha:
+                return self._ha_execute(rec, pkg, payload, resp["text"], corr)
             try:
                 o = parse_provider_json(resp["text"])
             except ProviderError as pe:
@@ -1222,6 +1335,93 @@ class Engine:
         finally:
             self.s.unlock()
             self._run_deferred()
+
+    def _ha_execute(self, rec, pkg, expected, text, corr):
+        """Called with the lock held, state RUNNING. Claude's stated intent must equal the package-derived
+        action exactly; only then does GAOP perform the allowlisted HA call(s)."""
+        txn_id, v = rec["txn_id"], rec["state_version"]
+        try:
+            o = extract_json(text, list(expected))
+        except ProviderError as pe:
+            rec["provider"]["status"] = "MALFORMED"
+            rec["execution"]["maybe_write"] = False
+            self._tr(rec, "STOP", "executor intent malformed: " + pe.detail)
+            self.s.put(rec, v)
+            return {"state": "STOP", "provider": "MALFORMED"}
+        if {k: o.get(k) for k in expected} != expected:
+            rec["provider"]["status"] = "INTENT_MISMATCH"
+            rec["execution"]["maybe_write"] = False
+            self._tr(rec, "STOP", "executor intent differs from authorised package; no HA call made")
+            self.s.put(rec, v)
+            return {"state": "STOP", "provider": "INTENT_MISMATCH"}
+        ha = self.adapters.get("ha_client") or HAClient()
+        ha.calls = []
+        ent = expected["entity_id"]
+        res = {"txn_id": txn_id, "proposal_sha256": rec["proposal_sha256"], "entity_id": ent,
+               "operation": pkg["operation"]}
+        try:
+            if pkg["operation"] == "ha.state.read":
+                res["observed"] = ha.get_state(ent)
+            else:
+                res["before"] = ha.get_state(ent)
+                res["requested"] = expected["desired"]
+                ha.set_boolean(expected["desired"])
+                res["after"] = ha.get_state(ent)
+        except HAError as he:
+            rec["ha"] = {"calls": list(ha.calls), "error": he.kind, "detail": he.detail}
+            wrote = any(c[0] == "POST" for c in ha.calls)
+            if he.kind == "UNCERTAIN" and wrote:
+                rec["reconcile"] = {"reason": "HA_WRITE_UNCERTAIN " + he.detail, "at": self.clock()}
+                self._tr(rec, "UNKNOWN_RECONCILE", "HA write outcome uncertain; no blind retry")
+            else:
+                rec["execution"]["maybe_write"] = wrote
+                self._tr(rec, "STOP" if not wrote else "UNKNOWN_RECONCILE",
+                         "HA %s: %s" % (he.kind, he.detail))
+            self.s.put(rec, v)
+            return {"state": rec["state"], "ha": he.kind}
+        res["ha_calls"] = list(ha.calls)
+        rb = canon(res)
+        rec["result"] = {"result": res, "result_sha256": sha(rb), "persisted_at": self.clock(),
+                         "executor": rec["claim"]["executor"], "package_digest": rec["package_digest"]}
+        rec["execution"]["maybe_write"] = False
+        self._tr(rec, "RESULT_PERSISTED", "HA result persisted (%d allowlisted calls)" % len(ha.calls))
+        self.s.put(rec, v)
+        return self._verify(txn_id)
+
+    def owner_pilot_request(self, *, peer, remote_user_id, kind):
+        """Owner-only Dashboard entry for the two P1 real-HA Pilot targets. Proposal only, not authority."""
+        if peer != INGRESS_GATEWAY:
+            raise Denied("NOT_INGRESS_GATEWAY", peer)
+        if not remote_user_id or sha((OWNER_PIN_PREFIX + remote_user_id).encode()) != OWNER_PIN:
+            raise Denied("NOT_OWNER", "request entry is owner-only")
+        if kind == "read_sun":
+            op, value, eff = "ha.state.read", {}, "GAOP reads the state of sun.sun (read-only); openai-api reviews it"
+        elif kind in ("probe_on", "probe_off"):
+            op, value = "ha.input_boolean.set", {"state": kind[6:]}
+            eff = ("GAOP sets input_boolean.gaop_pilot_probe to %s (disposable Pilot helper; no other entity); "
+                   "openai-api reviews it" % kind[6:])
+        else:
+            raise Denied("MALFORMED", "kind")
+        txn = "TXN-P1-DB-" + time.strftime("%Y%m%d%H%M%S", time.gmtime(self.clock()))
+        p = {"op": op, "target": HA_OP_TARGETS[op], "value": value,
+             "scope": "exactly one allowlisted Home Assistant entity; no other entity or service",
+             "effect": eff, "summary": "Dashboard P1 real-HA Pilot-target request", "ttl_seconds": 1800,
+             "route": "claude-api", "review_route": "openai-api", "evidence": "none"}
+        env = json.dumps({"protocol": PROTOCOL, "op": "propose", "txn_id": txn, "role": "designer",
+                          "envelope_id": "dash-" + txn, "proposal": p,
+                          "changed_condition": "owner-new-dashboard-request " + txn})
+        out = self.apply_envelope(env)
+        if out.get("outcome") == "ACCEPTED":
+            self.s.lock()
+            try:
+                rec = self.s.get(txn)
+                rec["origin"] = "dashboard-owner-request"
+                self.s.put(rec, rec["state_version"])
+            finally:
+                self.s.unlock()
+            self._defer(self.design_check, txn)
+            self._run_deferred()
+        return out
 
     def owner_request(self, *, peer, remote_user_id, value, route, evidence):
         """Dashboard request entry (owner only): creates a synthetic proposal, then the ChatGPT
@@ -1263,12 +1463,24 @@ class Engine:
         """Deterministic execution verification against the package predicates (called with lock)."""
         rec = self.s.get(txn_id)
         pkg, r = rec["exec_package"], rec["result"]["result"]
+        ent = pkg["targets"][0].split(":", 1)[1] if pkg["operation"] in HA_OP_TARGETS else None
+        calls = r.get("ha_calls", []) if isinstance(r, dict) else []
+        obs = (r.get("observed") or r.get("after") or {}) if isinstance(r, dict) else {}
         preds = {"echo_equals_value": isinstance(r, dict) and r.get("echo") == pkg["parameters"],
+                 "ha_entity_exact": isinstance(r, dict) and r.get("entity_id") == ent and obs.get("entity_id") == ent
+                 and all(c[1].endswith(ent) or c[1].startswith("/services/input_boolean/turn_") for c in calls),
+                 "ha_state_present": isinstance(obs.get("state"), str) and obs.get("state") not in ("", "unavailable", "unknown"),
+                 "ha_no_write": bool(calls) and all(c[0] == "GET" for c in calls),
+                 "ha_after_equals_requested": isinstance(r, dict) and r.get("requested") == pkg["parameters"].get("state")
+                 and (r.get("after") or {}).get("state") == pkg["parameters"].get("state"),
+                 "ha_single_write": sum(1 for c in calls if c[0] == "POST") == 1
+                 and [c[1] for c in calls if c[0] == "POST"] == ["/services/input_boolean/turn_%s" % pkg["parameters"].get("state")],
                  "bound_txn": isinstance(r, dict) and r.get("txn_id") == txn_id,
                  "bound_proposal": isinstance(r, dict) and r.get("proposal_sha256") == rec["proposal_sha256"],
                  "bound_package": rec["result"].get("package_digest") == rec["package_digest"]
                  and package_digest(pkg) == rec["package_digest"]}
-        ok = pkg["operation"] == "synthetic.echo" and all(preds[k] for k in pkg["verification"])
+        ok = pkg["operation"] in ALLOWED_OPS and set(pkg["verification"]) >= OP_PREDICATES[pkg["operation"]] \
+            and all(preds[k] for k in pkg["verification"])
         v = rec["state_version"]
         rec["verification"] = {"predicates": {k: preds[k] for k in pkg["verification"]},
                                "deterministic": "PASS" if ok else "FAIL", "at": self.clock(),
@@ -1297,7 +1509,8 @@ class Engine:
                    "targets": rec["exec_package"]["targets"], "parameters": rec["exec_package"]["parameters"],
                    "scope": rec["exec_package"]["scope"], "verification_predicates": rec["exec_package"]["verification"],
                    "stated_effect": rec["exec_package"]["constraints"]["effect"], "summary": rec["proposal"]["summary"],
-                   "operation_class": "synthetic-allowlisted" if rec["exec_package"]["operation"] in ALLOWED_OPS else "unknown"}
+                   "operation_class": ("real-HA-allowlisted-single-entity" if rec["exec_package"]["operation"] in HA_OP_TARGETS
+                                       else "synthetic-allowlisted" if rec["exec_package"]["operation"] in ALLOWED_OPS else "unknown")}
         if kind == "verify":
             payload.update(result=rec["result"]["result"], result_sha256=rec["result"]["result_sha256"],
                            deterministic_verification=rec["verification"],
@@ -1572,6 +1785,16 @@ class Engine:
                 "claim_id": (rec.get("claim") or {}).get("claim_id"),
                 "executor": (rec.get("claim") or {}).get("executor"),
                 "result_sha256": (rec.get("result") or {}).get("result_sha256"),
+                "ha_entity": ((rec.get("result") or {}).get("result") or {}).get("entity_id")
+                if isinstance((rec.get("result") or {}).get("result"), dict) else None,
+                "ha_observed_state": (((rec.get("result") or {}).get("result") or {}).get("observed") or {}).get("state")
+                if isinstance((rec.get("result") or {}).get("result"), dict) else None,
+                "ha_before_state": (((rec.get("result") or {}).get("result") or {}).get("before") or {}).get("state")
+                if isinstance((rec.get("result") or {}).get("result"), dict) else None,
+                "ha_after_state": (((rec.get("result") or {}).get("result") or {}).get("after") or {}).get("state")
+                if isinstance((rec.get("result") or {}).get("result"), dict) else None,
+                "ha_calls": ((rec.get("result") or {}).get("result") or {}).get("ha_calls")
+                if isinstance((rec.get("result") or {}).get("result"), dict) else None,
                 "deterministic_verification": (rec.get("verification") or {}).get("deterministic"),
                 "evidence_status": (rec.get("evidence") or {}).get("status"),
                 "evidence_file_sha256": ev.get("sha256"),
@@ -2262,6 +2485,11 @@ class Handler(BaseHTTPRequestHandler):
                 log("REQUEST dashboard-owner -> %s" % json.dumps(out, sort_keys=True))
                 return self._send(200 if out.get("outcome") == "ACCEPTED" else 409,
                                   self._panel(owner, notice="request: %s %s" % (out.get("txn_id", ""), out.get("state") or out.get("code"))), "text/html")
+            if path == "/pilot_request":
+                out = self.engine.owner_pilot_request(peer=peer, remote_user_id=uid, kind=g("kind"))
+                log("REQUEST dashboard-owner P1 -> %s" % json.dumps(out, sort_keys=True))
+                return self._send(200 if out.get("outcome") == "ACCEPTED" else 409,
+                                  self._panel(owner, notice="P1 request: %s %s" % (out.get("txn_id", ""), out.get("state") or out.get("code"))), "text/html")
             if path in ("/setup/provider", "/setup/provider_delete"):
                 if peer != INGRESS_GATEWAY or not owner:
                     raise Denied("NOT_OWNER", "setup is owner-only")
@@ -2404,6 +2632,13 @@ class Handler(BaseHTTPRequestHandler):
                        '<button>Create proposal</button></form><p class="st">Creates a proposal and asks ChatGPT (openai-api: %s) '
                        'to problem-check it. Claude executes only after you press Authorize; ChatGPT then reviews the result.</p></div>'
                        % (base, opts_r, "configured" if ps["openai-api"]["configured"] else "NOT configured — results will be PARTIAL"))
+        if owner and provider_status(e.s)["claude-api"]["configured"]:
+            req += ('<div class="card"><h3>P1 real-HA Pilot targets</h3><form method="post" action="%s/pilot_request">'
+                    '<button name="kind" value="read_sun">Read sun.sun</button> '
+                    '<button name="kind" value="probe_on">Set gaop_pilot_probe ON</button> '
+                    '<button name="kind" value="probe_off">Set gaop_pilot_probe OFF</button></form>'
+                    '<p class="st">Creates a proposal only (exactly one allowlisted entity). It runs after you press '
+                    'Authorize on its card.</p></div>' % base)
         setup = ""
         if owner:
             ps = provider_status(e.s)
@@ -2486,6 +2721,18 @@ def serve():
         while True:
             time.sleep(3600)
     opts = read_options()
+    try:
+        # P1 boundary proof: Supervisor API must be refused (hassio_api=false). Status only; body discarded.
+        sreq = urllib.request.Request("http://supervisor/supervisor/info",
+                                      headers={"Authorization": "Bearer " + os.environ.get("SUPERVISOR_TOKEN", "")})
+        try:
+            with urllib.request.urlopen(sreq, timeout=5) as r:
+                sp = r.status
+        except urllib.error.HTTPError as he:
+            sp = he.code
+        log("BOUNDARY supervisor_api_probe status=%s (%s)" % (sp, "DENIED" if sp in (401, 403) else "NOT DENIED"))
+    except Exception as ex:
+        log("BOUNDARY supervisor_api_probe error=%s (unreachable)" % type(ex).__name__)
     cred = DriveCred(store)
     eng = Engine(store, adapters={"drive_evidence": drive_evidence_live(cred.client, opts)}, async_review=True)
     for t, st in eng.boot_reconcile():
@@ -3322,6 +3569,105 @@ def run_selftest():
                 claim="I approve", evidence_status="AUTHORITY")).get("code") == "PROVIDER_AUTHORITY_CLAIM")
             chk("ASSUME no-credential-in-v08-records", KEY_A not in json.dumps([st8.get(t) for t in ("TXN-RV-0001", "TXN-R1-0010")]))
             LOG_SINK = None
+
+            # ================= v0.8.2 P1 real-HA targets (DAI-IN-512) =================
+            HS = {"sun.sun": "above_horizon", "input_boolean.gaop_pilot_probe": "off"}
+            HCALLS = []
+            HMODE = {"post": 200, "get": 200, "post_raise": False}
+
+            def fha(method, path, body, timeout):
+                HCALLS.append((method, path))
+                if method == "GET":
+                    ent = path.split("/states/", 1)[1]
+                    if HMODE["get"] != 200 or ent not in HS:
+                        return HMODE["get"] if HMODE["get"] != 200 else 404, b""
+                    return 200, json.dumps({"entity_id": ent, "state": HS[ent], "last_changed": "t"}).encode()
+                if HMODE["post_raise"]:
+                    HS["input_boolean.gaop_pilot_probe"] = "on"
+                    raise HAError("UNCERTAIN", "timeout")
+                if HMODE["post"] == 200:
+                    HS[body["entity_id"]] = path.rsplit("_", 1)[1]
+                return HMODE["post"], b"[]"
+            e8.adapters["ha_client"] = HAClient(fha)
+            e8.transport = mk_review()
+
+            def P1(txn, op, target=None, value=None, route="claude-api", cc="selftest-variant", **kw):
+                return e8.apply_envelope(env("propose", txn, changed_condition=cc, proposal=prop(
+                    op=op, target=target or HA_OP_TARGETS.get(op, "ha:x"), route=route,
+                    value={} if value is None and op == "ha.state.read" else value, **kw)))
+
+            def run1(txn, op, value=None, transport=None):
+                P1(txn, op, value=value)
+                auth8(txn)
+                n = len(HCALLS)
+                o = e8.api_execute(txn, transport=transport or mk("anthropic"))
+                return o, st8.get(txn), HCALLS[n:]
+            o, r, c = run1("TXN-P1-0001", "ha.state.read")
+            chk("P1 sun.sun read via GAOP path->COMPLETED", r["state"] == "COMPLETED" and r["result"]["result"]["observed"]["state"] == "above_horizon"
+                and r["receipt"]["ha_entity"] == "sun.sun" and r["receipt"]["ha_observed_state"] == "above_horizon")
+            chk("P1 read op makes no write (GET only, exactly sun.sun)", c == [("GET", "/states/sun.sun")]
+                and r["verification"]["predicates"]["ha_no_write"] is True)
+            o, r, c = run1("TXN-P1-0002", "ha.input_boolean.set", {"state": "on"})
+            chk("P1 probe set ON via exact authorised txn->COMPLETED", r["state"] == "COMPLETED" and HS["input_boolean.gaop_pilot_probe"] == "on"
+                and r["receipt"]["ha_before_state"] == "off" and r["receipt"]["ha_after_state"] == "on")
+            chk("P1 consequential path: before/requested/after + single write receipt-bound",
+                c == [("GET", "/states/input_boolean.gaop_pilot_probe"), ("POST", "/services/input_boolean/turn_on"),
+                      ("GET", "/states/input_boolean.gaop_pilot_probe")]
+                and r["verification"]["predicates"]["ha_single_write"] and r["verification"]["predicates"]["ha_after_equals_requested"]
+                and r["receipt"]["result_sha256"] == sha(canon(r["result"]["result"])) and r["receipt"]["package_digest"] == r["package_digest"])
+            chk("P1 wrong entity denied (set light.kitchen)", P1("TXN-P1-0003", "ha.input_boolean.set", "ha:light.kitchen", {"state": "on"}).get("code") == "TARGET_NOT_ALLOWLISTED")
+            chk("P1 wrong entity denied (read probe via read op / other entity)",
+                P1("TXN-P1-0004", "ha.state.read", "ha:input_boolean.gaop_pilot_probe").get("code") == "TARGET_NOT_ALLOWLISTED"
+                and P1("TXN-P1-0005", "ha.state.read", "ha:sensor.anything").get("code") == "TARGET_NOT_ALLOWLISTED")
+            chk("P1 wrong operation denied (generic service call)", P1("TXN-P1-0006", "ha.call_service", "ha:sun.sun", {"service": "x"}).get("code") == "OP_NOT_ALLOWLISTED")
+            chk("P1 wrong value denied", P1("TXN-P1-0007", "ha.input_boolean.set", value={"state": "toggle"}).get("code") == "MALFORMED"
+                and P1("TXN-P1-0008", "ha.state.read", value={"x": 1}).get("code") == "MALFORMED")
+            chk("P1 wrong route denied (pull/mock routes cannot carry HA ops)",
+                P1("TXN-P1-0009", "ha.state.read", route="claude-session", review_route="openai-api").get("code") == "ROUTE_NOT_ALLOWED"
+                and P1("TXN-P1-0010", "ha.state.read", route="mock", review_route="mock-reviewer").get("code") == "ROUTE_NOT_ALLOWED")
+            n0 = len(HCALLS)
+            o, r, c = run1("TXN-P1-0011", "ha.input_boolean.set", {"state": "off"},
+                           transport=mk("anthropic", mutate=lambda x: x.update(entity_id="light.kitchen")))
+            chk("P1 executor intent mismatch->STOP, zero HA calls", o.get("provider") == "INTENT_MISMATCH" and r["state"] == "STOP"
+                and len(HCALLS) == n0 and HS["input_boolean.gaop_pilot_probe"] == "on")
+            P1("TXN-P1-0012", "ha.input_boolean.set", value={"state": "off"})
+            auth8("TXN-P1-0012")
+            rt = st8.get("TXN-P1-0012")
+            rt["exec_package"]["parameters"] = {"state": "on"}
+            st8.put(rt, rt["state_version"])
+            n0 = len(HCALLS)
+            chk("P1 wrong package (post-authority tamper)->STOP, zero HA calls",
+                denied(lambda: e8.api_execute("TXN-P1-0012", transport=mk("anthropic")), "PACKAGE_DIGEST_MISMATCH") and len(HCALLS) == n0)
+            chk("P1 wrong stage denied (re-execute completed)", denied(lambda: e8.api_execute("TXN-P1-0002", transport=mk("anthropic")), "WRONG_STATE"))
+            P1("TXN-P1-0013", "ha.state.read")
+            auth8("TXN-P1-0013")
+            chk("P1 alternate route: pull claim on HA txn denied", e8.apply_envelope(claim_env("TXN-P1-0013", "rogue", e8.package("TXN-P1-0013"))).get("code") == "ADAPTER_OWNED_ROUTE")
+            hc = HAClient(fha)
+            chk("P1 alternate route: HA client refuses any non-allowlisted call",
+                denied(lambda: hc._req("GET", "/states/light.kitchen"), "HA_CALL_NOT_ALLOWLISTED")
+                and denied(lambda: hc._req("POST", "/services/light/turn_on", {"entity_id": "light.kitchen"}), "HA_CALL_NOT_ALLOWLISTED")
+                and denied(lambda: hc._req("POST", "/services/input_boolean/turn_on", {"entity_id": "input_boolean.ups_outage_in_progress"}), "HA_CALL_NOT_ALLOWLISTED")
+                and denied(lambda: hc._req("GET", "/config"), "HA_CALL_NOT_ALLOWLISTED") and hc.calls == [])
+            HMODE["post_raise"] = True
+            o, r, c = run1("TXN-P1-0014", "ha.input_boolean.set", {"state": "on"}, transport=mk("anthropic"))
+            HMODE["post_raise"] = False
+            chk("P1 ambiguous HA write->UNKNOWN_RECONCILE (no blind retry)", r["state"] == "UNKNOWN_RECONCILE" and [x for x in c if x[0] == "POST"] == [("POST", "/services/input_boolean/turn_on")])
+            HMODE["post"] = 400
+            o, r, c = run1("TXN-P1-0015", "ha.input_boolean.set", {"state": "off"})
+            HMODE["post"] = 200
+            chk("P1 refused HA write (4xx)->visible non-COMPLETED, single attempt", r["state"] in ("STOP", "UNKNOWN_RECONCILE")
+                and r["state"] != "COMPLETED" and len([x for x in c if x[0] == "POST"]) == 1)
+            HMODE["get"] = 503
+            o, r, c = run1("TXN-P1-0016", "ha.state.read")
+            HMODE["get"] = 200
+            chk("P1 read failure->STOP (no write)", r["state"] == "STOP" and all(x[0] == "GET" for x in c))
+            chk("P1 repeat completed set without changed condition->existing receipt",
+                P1("TXN-P1-0017", "ha.input_boolean.set", value={"state": "on"}, cc=None).get("code") == "DUPLICATE_OPERATION")
+            chk("P1 synthetic op unaffected + synthetic target rule kept",
+                P1("TXN-P1-0018", "synthetic.echo", "light.kitchen", {"n": 1}, route="mock", review_route="mock-reviewer").get("code") == "SCOPE_NOT_SYNTHETIC")
+            chk("P1 HA ops cannot shed verification predicates",
+                P1("TXN-P1-0019", "ha.state.read", verify=["bound_txn", "echo_equals_value"]).get("code") == "MALFORMED")
+            e8.adapters.pop("ha_client", None)
 
             # --- unsupported newer store schema fails closed ---
             m = os.path.join(td, "gaop", "meta.json")

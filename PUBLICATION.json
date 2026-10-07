@@ -1,14 +1,14 @@
 {
- "gaop_version": "0.8.1",
- "package_digest": "74f4dfd0645479380ae2090e5682760157546e9e27fa7570fae2279079fcd3e6",
+ "gaop_version": "0.8.2",
+ "package_digest": "53ab3cc4307444e7c5204f2cff4d216c5c3e3f536a5b4d8605767d1119cd6eca",
  "previous_release": {
-  "gaop_version": "0.8.0",
-  "private_source_commit": "9f1886e321459233754d076c5806b197a7f142c3",
-  "public_main": "696ae3028f05be5530e498eaf94498f9dbc3711f"
+  "gaop_version": "0.8.1",
+  "private_source_commit": "0b446d8d380ef73f19c2ac83f419d5be3df17157",
+  "public_main": "4f4dfc4c36b8c234d50aa2f2b4050f9e1d83e74b"
  },
- "private_source_commit": "0b446d8d380ef73f19c2ac83f419d5be3df17157",
- "public_distribution_commit": "recorded after merge (see git history / DAI-OUT-509)",
+ "private_source_commit": "2cf435980cc5bd052c047544e6258f4f8c24535b",
+ "public_distribution_commit": "recorded after merge (see git history / DAI-OUT-512)",
  "release_manifest": "gaop/GAOP_RELEASE.json",
- "rollback_target": "public commit 696ae3028f05be5530e498eaf94498f9dbc3711f (GAOP 0.8.0); 0.7.2 = fc9940ee1256187ad0d5c513f98857fe04b5b136",
+ "rollback_target": "public commit 4f4dfc4c36b8c234d50aa2f2b4050f9e1d83e74b (GAOP 0.8.1, homeassistant_api=false)",
  "schema": "gaop.publication.v1"
 }

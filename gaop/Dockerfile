@@ -1,4 +1,4 @@
-# GAOP v0.8.1 — dual-AI production build (v0.7.0 lineage). Base image set explicitly (Supervisor no longer
+# GAOP v0.8.2 — dual-AI production build (v0.7.0 lineage). Base image set explicitly (Supervisor no longer
 # auto-provides BUILD_FROM). Stdlib-only Python; ca-certificates for Google TLS.
 FROM ghcr.io/home-assistant/base:latest
 
@@ -12,7 +12,7 @@ COPY GAOP_RELEASE.json /GAOP_RELEASE.json
 RUN chmod a+x /run.sh /gaop_core.py
 
 LABEL \
-  io.hass.version="0.8.1" \
+  io.hass.version="0.8.2" \
   io.hass.type="addon" \
   io.hass.arch="aarch64|amd64"
 

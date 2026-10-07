@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.2 (DAI-IN-512 P1 — bounded real-HA Pilot targets)
+- Exactly two real Home Assistant operations, each bound to exactly one entity: `ha.state.read` on `sun.sun`
+  (read-only) and `ha.input_boolean.set` on `input_boolean.gaop_pilot_probe` (`{state: on|off}`). No generic
+  entity read, no generic service call.
+- HA ops run only on the `claude-api` route: Claude states the exact action bound to txn/proposal/correlation;
+  GAOP executes only if it equals the package-derived action (else STOP, zero HA calls), via `HAClient`, a fixed
+  table of four HA Core API calls. Write outcome uncertain → UNKNOWN_RECONCILE, no retry.
+- Verification predicates per operation (`ha_entity_exact`, `ha_state_present`, `ha_no_write`,
+  `ha_after_equals_requested`, `ha_single_write` + bindings); a proposal cannot shed them. Receipt adds HA fields.
+- `homeassistant_api: true` (Core API only); `hassio_api` stays false; startup logs a Supervisor-API probe status.
+- Owner Dashboard card "P1 real-HA Pilot targets". Selftest 171 checks.
+
 ## 0.8.1 (DAI-IN-509 live-validation fixes)
 - Panel auto-refresh returns to the panel root (no `NOT_FOUND` after an Authorize/decision POST).
 - Design/review payload carries the transaction's stated effect, summary and operation class; the design
