@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.3"
+VERSION = "0.8.4"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -581,6 +581,22 @@ def expected_ha_intent(pkg):
     return {"action": "set_state", "entity_id": ent, "desired": pkg["parameters"]["state"]}
 
 
+S6_ENV_DIR = os.environ.get("GAOP_S6_ENV_DIR", "/run/s6/container_environment")
+
+
+def supervisor_token():
+    """The Supervisor-issued App token. Under s6-overlay a plain /bin/sh entrypoint does not inherit the
+    container environment, so fall back to s6's container_environment file. Never logged or returned."""
+    t = os.environ.get("SUPERVISOR_TOKEN", "")
+    if t:
+        return t
+    try:
+        with open(os.path.join(S6_ENV_DIR, "SUPERVISOR_TOKEN")) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
 class HAError(Exception):
     """kind: DEFINITIVE (request refused/failed, no write happened) | UNCERTAIN (write may have happened)."""
     def __init__(self, kind, detail=""):
@@ -589,7 +605,7 @@ class HAError(Exception):
 
 
 def ha_http(method, path, body, timeout):
-    tok = os.environ.get("SUPERVISOR_TOKEN", "")
+    tok = supervisor_token()
     req = urllib.request.Request(HA_CORE_URL + path, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"},
                                  method=method)
@@ -2726,7 +2742,7 @@ def serve():
     try:
         # P1 boundary proof: Supervisor API must be refused (hassio_api=false). Status only; body discarded.
         sreq = urllib.request.Request("http://supervisor/supervisor/info",
-                                      headers={"Authorization": "Bearer " + os.environ.get("SUPERVISOR_TOKEN", "")})
+                                      headers={"Authorization": "Bearer " + supervisor_token()})
         try:
             with urllib.request.urlopen(sreq, timeout=5) as r:
                 sp = r.status
@@ -2738,7 +2754,7 @@ def serve():
         except HAError as he:
             cst = "error:" + he.detail
         log("BOUNDARY core_api_root_probe status=%s token_present=%s url=%s" % (
-            cst, bool(os.environ.get("SUPERVISOR_TOKEN")), HA_CORE_URL))
+            cst, bool(supervisor_token()), HA_CORE_URL))
     except Exception as ex:
         log("BOUNDARY supervisor_api_probe error=%s (unreachable)" % type(ex).__name__)
     cred = DriveCred(store)
@@ -3676,6 +3692,18 @@ def run_selftest():
             chk("P1 HA ops cannot shed verification predicates",
                 P1("TXN-P1-0019", "ha.state.read", verify=["bound_txn", "echo_equals_value"]).get("code") == "MALFORMED")
             e8.adapters.pop("ha_client", None)
+            with tempfile.TemporaryDirectory() as sd:
+                global S6_ENV_DIR
+                saved_dir, saved_env = S6_ENV_DIR, os.environ.pop("SUPERVISOR_TOKEN", None)
+                S6_ENV_DIR = sd
+                try:
+                    none_ok = supervisor_token() == ""
+                    open(os.path.join(sd, "SUPERVISOR_TOKEN"), "w").write("tok-test\n")
+                    chk("P1 token resolves from s6 container_environment when env lacks it", none_ok and supervisor_token() == "tok-test")
+                finally:
+                    S6_ENV_DIR = saved_dir
+                    if saved_env is not None:
+                        os.environ["SUPERVISOR_TOKEN"] = saved_env
 
             # --- unsupported newer store schema fails closed ---
             m = os.path.join(td, "gaop", "meta.json")
