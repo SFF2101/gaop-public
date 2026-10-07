@@ -1,7 +1,7 @@
 name: "Governed AI Operations Platform (GAOP)"
-version: "0.7.2"
+version: "0.8.0"
 slug: gaop
-description: "GAOP durable production generation: Dashboard-authorised, fail-closed transaction control plane (synthetic operations only in v0.7.x). App-private /data only; least privilege; no secrets in distribution."
+description: "GAOP durable production generation: Dashboard-authorised, fail-closed transaction control plane (dual-AI production build v0.8.x; synthetic operations only). App-private /data only; least privilege; no secrets in distribution."
 url: "https://github.com/SFF2101/gaop-public"
 arch:
   - aarch64
