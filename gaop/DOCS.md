@@ -1,5 +1,8 @@
 # GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
 
+**v0.8.5:** the OpenAI design/review model is pinned in code (`gpt-4.1`), and real-HA reviews receive the
+code-enforced capability facts (§16 of the as-built document).
+
 **v0.8.2 (P1):** besides synthetic operations, GAOP can read exactly `sun.sun` and set exactly
 `input_boolean.gaop_pilot_probe` (Home Assistant Core API only; Supervisor API disabled). See §15 of the
 as-built document.

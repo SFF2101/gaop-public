@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAOP v0.8.2 — production dual-AI build (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
+"""GAOP v0.8.5 — production dual-AI build (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
 
 Single stdlib-only module. Roles (repository-role invariant):
   GitHub private repo = source; gaop-public = generated secret-free distribution;
@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.4"
+VERSION = "0.8.5"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -497,6 +497,10 @@ PROVIDERS = {
                    "default_model": "", "key_re": r"^sk-[A-Za-z0-9_-]{20,250}$"},
 }
 MODEL_RE = re.compile(r"^[A-Za-z0-9._:-]{2,64}$")
+# DAI-IN-513: the OpenAI Designer/Reviewer model is pinned in code (provenance-controlled), overriding the model
+# stored with the owner's openai-api key for review/design calls only. Non-reasoning chat-completions model,
+# compatible with the existing adapter (max_completion_tokens, system+user messages).
+OPENAI_REVIEW_MODEL = "gpt-4.1"
 MAX_PROVIDER_RESPONSE = 65536
 PROVIDER_TIMEOUT = 60
 EXEC_SYSTEM = ("You are a bounded GAOP synthetic executor. You have no tools and no other duties. "
@@ -538,6 +542,7 @@ def provider_status(store):
     for r in PROVIDERS:
         c = load_provider_cred(store, r)
         out[r] = {"configured": bool(c), "model": (c or {}).get("model"),
+                  "review_model": OPENAI_REVIEW_MODEL if r == "openai-api" else None,
                   "configured_at": (c or {}).get("configured_at")}
     return out
 
@@ -728,6 +733,28 @@ def extract_json(text, need):
     return o
 
 
+def enforced_ha_facts(operation):
+    """DAI-IN-513: code-enforced capability facts given to the reviewer for real-HA operations. Each fact is
+    true by construction of HA_OP_TARGETS / validate_proposal / HAClient.CALLS / config.yaml."""
+    if operation not in HA_OP_TARGETS:
+        return None
+    calls = sorted("%s %s" % c for c in HAClient.CALLS)
+    return [
+        "Operation and target are exactly code-allowlisted: ha.state.read only on ha:sun.sun; "
+        "ha.input_boolean.set only on ha:input_boolean.gaop_pilot_probe.",
+        "ha.state.read on sun.sun is implemented as exactly one HTTP GET /api/states/sun.sun; the read path "
+        "has no write call available, and predicate ha_no_write requires the recorded calls to equal "
+        "[GET /states/sun.sun].",
+        "ha.input_boolean.set is limited to input_boolean.gaop_pilot_probe: GET its state, exactly one POST "
+        "input_boolean turn_on|turn_off with body exactly {entity_id: input_boolean.gaop_pilot_probe}, GET its state.",
+        "GAOP's Home Assistant client is a fixed table of exactly these calls: " + "; ".join(calls) + ". Any other "
+        "entity, service, operation, target, stage, route or package is denied fail-closed before any network call.",
+        "homeassistant_api=true gives the App a broad Core API token, but GAOP's code allowlist above is the "
+        "enforced transaction boundary.",
+        "Supervisor/Hass.io access is disabled (hassio_api=false; Supervisor API denied at runtime).",
+    ]
+
+
 def review_prompt(kind, payload):
     """Compact machine instruction for the OpenAI Designer/Reviewer. kind: design | verify."""
     if kind == "design":
@@ -743,6 +770,13 @@ def review_prompt(kind, payload):
                'Return {"verdict":"ACCEPT"|"DISAGREE_VERIFICATION","issue_code":"<UPPER_SNAKE or NONE>",'
                '"claim":"<=200 chars","evidence_status":"VERIFICATION_EVIDENCE"|"INFERENCE"|"UNKNOWN",'
                '"txn_id":<copy>,"package_digest":<copy>,"correlation_id":<copy>}.')
+    if payload.get("enforced_capability_facts"):
+        ask += (' This is a real Home Assistant operation. PAYLOAD.enforced_capability_facts are enforced by GAOP '
+                'code, not claims: evaluate the actual bounded executable package together with those enforced '
+                'facts, not hypothetical generic Home Assistant capabilities. Do not object that the transaction '
+                'could reach another entity, service or write path that the enforced facts exclude; do object to any '
+                'concrete problem in the package itself (e.g. operation, target, parameters or predicates '
+                'inconsistent with the enforced facts).')
     return ask + " PAYLOAD=" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -1528,6 +1562,9 @@ class Engine:
                    "stated_effect": rec["exec_package"]["constraints"]["effect"], "summary": rec["proposal"]["summary"],
                    "operation_class": ("real-HA-allowlisted-single-entity" if rec["exec_package"]["operation"] in HA_OP_TARGETS
                                        else "synthetic-allowlisted" if rec["exec_package"]["operation"] in ALLOWED_OPS else "unknown")}
+        facts = enforced_ha_facts(rec["exec_package"]["operation"])
+        if facts:
+            payload["enforced_capability_facts"] = facts
         if kind == "verify":
             payload.update(result=rec["result"]["result"], result_sha256=rec["result"]["result_sha256"],
                            deterministic_verification=rec["verification"],
@@ -1545,6 +1582,7 @@ class Engine:
         cred = load_provider_cred(self.s, route)
         if cred is None:
             raise ProviderError("NOT_CONFIGURED", route)
+        cred = dict(cred, model=OPENAI_REVIEW_MODEL)           # DAI-IN-513 code-pinned reviewer model
         prompt = review_prompt(kind, payload)
         lim, used = rec["budget"]["limits"], rec["budget"]["used"]
         if used["input_tokens"] + len(prompt) // 4 > lim["input_tokens"]:
@@ -2664,7 +2702,9 @@ class Handler(BaseHTTPRequestHandler):
             for r, info in PROVIDERS.items():
                 stt = ps[r]
                 setup += "<p><b>%s</b> (%s): %s</p>" % (esc(r), esc(info["vendor"]),
-                         ("configured · model " + esc(stt["model"])) if stt["configured"] else "not configured")
+                         (("configured · model " + esc(stt["model"])
+                           + ((" · design/review model " + esc(stt["review_model"]) + " (pinned)") if stt.get("review_model") else ""))
+                          if stt["configured"] else "not configured"))
                 if stt["configured"]:
                     setup += ('<form method="post" action="%s/setup/provider_delete"><input type="hidden" name="provider" value="%s">'
                               '<button>Delete %s key</button></form>' % (base, esc(r), esc(info["vendor"])))
@@ -3468,7 +3508,7 @@ def run_selftest():
             e8.api_execute("TXN-RV-0001", transport=mk("anthropic"))
             rv1 = st8.get("TXN-RV-0001")
             chk("REVIEW openai-machine-review-path->COMPLETED", rv1["state"] == "COMPLETED" and rv1["review"]["route"] == "openai-api"
-                and rv1["review"]["model"] == "test-model" and rv1["review"]["request_id"] == "req_rv" and rv1["provider"]["vendor"] == "anthropic")
+                and rv1["review"]["model"] == OPENAI_REVIEW_MODEL and rv1["review"]["request_id"] == "req_rv" and rv1["provider"]["vendor"] == "anthropic")
             e8.transport = mk_review([("ACCEPT", "VERIFICATION_EVIDENCE")])
             os.rename(provider_cred_path(st8, "openai-api"), provider_cred_path(st8, "openai-api") + ".off")
             P("TXN-RV-0002", route="claude-api", value={"rv": 2}, evidence="none")
@@ -3704,6 +3744,70 @@ def run_selftest():
                     S6_ENV_DIR = saved_dir
                     if saved_env is not None:
                         os.environ["SUPERVISOR_TOKEN"] = saved_env
+
+            # ================= v0.8.5 reviewer hardening (DAI-IN-513) =================
+            RQ = []
+            base_rv = mk_review()
+
+            def cap_rv(url, headers, body, timeout):
+                bb = json.loads(body.decode())
+                RQ.append((bb["model"], bb["messages"][-1]["content"]))
+                return base_rv(url, headers, body, timeout)
+            e8.transport = cap_rv
+            e8.adapters["ha_client"] = HAClient(fha)
+            P1("TXN-P1-0020", "ha.state.read")
+            e8.design_check("TXN-P1-0020")
+            r20d = st8.get("TXN-P1-0020")
+            chk("RVH reviewer model code-pinned (stored key model untouched)",
+                RQ and all(m == OPENAI_REVIEW_MODEL == "gpt-4.1" for m, _ in RQ)
+                and load_provider_cred(st8, "openai-api")["model"] == "test-model"
+                and r20d["design_review"]["model"] == OPENAI_REVIEW_MODEL)
+            u20 = RQ[0][1] if RQ else ""
+            pl20 = json.loads(u20[u20.index("PAYLOAD=") + 8:]) if "PAYLOAD=" in u20 else {}
+            chk("RVH HA design payload carries enforced capability facts",
+                pl20.get("enforced_capability_facts") == enforced_ha_facts("ha.state.read")
+                and any("exactly one HTTP GET /api/states/sun.sun" in f and "no write call" in f for f in pl20["enforced_capability_facts"])
+                and any("hassio_api=false" in f for f in pl20["enforced_capability_facts"])
+                and any("broad Core API token" in f and "enforced transaction boundary" in f for f in pl20["enforced_capability_facts"])
+                and any("only on ha:input_boolean.gaop_pilot_probe" in f for f in pl20["enforced_capability_facts"]))
+            chk("RVH prompt instructs: evaluate bounded package + enforced facts, not hypothetical HA capability",
+                "not hypothetical generic Home Assistant capabilities" in u20 and "do object to any concrete problem" in u20)
+            chk("RVH enforced facts match code allowlist exactly",
+                all(("%s %s" % c) in " ".join(enforced_ha_facts("ha.input_boolean.set")) for c in HAClient.CALLS)
+                and len(HAClient.CALLS) == 4 and set(HA_OP_TARGETS) == {"ha.state.read", "ha.input_boolean.set"}
+                and HA_OP_TARGETS["ha.state.read"] == "ha:sun.sun"
+                and HA_OP_TARGETS["ha.input_boolean.set"] == "ha:input_boolean.gaop_pilot_probe")
+            chk("RVH synthetic ops get no HA facts (prompt unchanged)",
+                enforced_ha_facts("synthetic.echo") is None
+                and "enforced_capability_facts" not in review_prompt("design", {"kind": "design"})
+                and "not hypothetical" not in review_prompt("design", {"kind": "design"}))
+            n0 = len(RQ)
+            auth8("TXN-P1-0020")
+            n1 = len(HCALLS)
+            e8.api_execute("TXN-P1-0020", transport=mk("anthropic"))
+            r20 = st8.get("TXN-P1-0020")
+            chk("RVH HA verify review also pinned + facts; read stays GET-only",
+                r20["state"] == "COMPLETED" and HCALLS[n1:] == [("GET", "/states/sun.sun")]
+                and len(RQ) > n0 and all(m == OPENAI_REVIEW_MODEL for m, _ in RQ[n0:])
+                and '"enforced_capability_facts"' in RQ[-1][1] and r20["review"]["model"] == OPENAI_REVIEW_MODEL)
+            RVD = [("DISAGREE_DESIGN", "INFERENCE")]
+
+            def dis_rv(url, headers, body, timeout):
+                bb = json.loads(body.decode())
+                u = bb["messages"][-1]["content"]
+                pl = json.loads(u[u.index("PAYLOAD=") + 8:])
+                vd = RVD.pop(0) if RVD else ("NO_OBJECTION", "FRESH_OBSERVATION")
+                o = {"verdict": vd[0], "issue_code": "HA_NO_WRITE", "claim": "x", "evidence_status": vd[1],
+                     "txn_id": pl["txn_id"], "package_digest": pl["package_digest"], "correlation_id": pl["correlation_id"]}
+                return 200, {"x-request-id": "r"}, json.dumps({"id": "c", "model": bb["model"],
+                                                                "choices": [{"message": {"content": json.dumps(o)}}]}).encode()
+            e8.transport = dis_rv
+            P1("TXN-P1-0021", "ha.state.read")
+            e8.design_check("TXN-P1-0021")
+            chk("RVH reviewer objection still blocks Authorize (disagreement handling unchanged)",
+                st8.get("TXN-P1-0021")["state"] == "DISAGREEMENT" and denied(lambda: auth8("TXN-P1-0021")))
+            e8.transport = mk_review()
+            e8.adapters.pop("ha_client", None)
 
             # --- unsupported newer store schema fails closed ---
             m = os.path.join(td, "gaop", "meta.json")
