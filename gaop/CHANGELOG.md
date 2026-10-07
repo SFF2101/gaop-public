@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.1 (DAI-IN-509 live-validation fixes)
+- Panel auto-refresh returns to the panel root (no `NOT_FOUND` after an Authorize/decision POST).
+- Design/review payload carries the transaction's stated effect, summary and operation class; the design
+  prompt asks ChatGPT to judge the proposal against its own stated purpose (it may still object).
+- A reconsidered design disagreement is kept in `prior_disagreements` with its outcome and appears in the
+  transaction view and receipt (`gaop.receipt.v3.prior_disagreements`).
+- Default `provider_calls` budget 4 → 5 (design + one design reconsideration + execution + review + one
+  review reconsideration); policy ceiling unchanged (6). Selftest 151 checks.
+
 ## 0.8.0 (DAI-IN-509 production build; synthetic operations only)
 - R1: exact executable package `gaop.exec_package.v1` + SHA-256 `package_digest`; owner authority binds the
   digest; every consequential step re-verifies it; post-authority change → STOP.
