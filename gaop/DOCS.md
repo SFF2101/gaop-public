@@ -1,4 +1,11 @@
-# GAOP — Governed AI Operations Platform (v0.7.x, durable production generation)
+# GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
+
+**v0.8.0:** the canonical as-built description of the production mechanisms (R1 package/authority binding,
+R2 idempotency/checkpoints, R3 capability scoping, budgets, liveness, dual-AI review/disagreement,
+anti-assumption) is `governance/GAOP_PRODUCTION_ARCHITECTURE_AS_BUILT_v1.0.0_2026-10-07.md` in the private
+source repository. Sections below describe the v0.7.x foundation, which v0.8.0 keeps; where they differ the
+as-built document governs (notably: `openai-api` is a reviewer route, not an executor; envelopes carry a
+`role`; terminal `PARTIAL`; receipt `gaop.receipt.v3`).
 
 This file is the self-sufficient operating description of the repository-installed GAOP App.
 The earlier local POC App (`local_gaop_gate_a_poc`, v0.6.0) is **retained historical evidence

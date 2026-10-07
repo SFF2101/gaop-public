@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAOP v0.7.0 — durable production generation: control plane core.
+"""GAOP v0.8.0 — production dual-AI build (DAI-IN-509): control plane core.
 
 Single stdlib-only module. Roles (repository-role invariant):
   GitHub private repo = source; gaop-public = generated secret-free distribution;
@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.7.2"
+VERSION = "0.8.0"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -39,14 +39,68 @@ OWNER_PIN = "deb39f6c5eaeb0d19713042adc11435425a59c28f2e41e012411e54839f70361"
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
 ALLOWED_OPS = {"synthetic.echo"}       # synthetic/allowlisted operations only (Phase 0.5R)
-ALLOWED_ROUTES = {"claude-session", "claude-api", "openai-api", "github-executor", "mock"}
-ENVELOPE_OPS = {"propose", "revise", "cancel", "claim", "begin", "result", "reconcile"}
+OP_VERSIONS = {"synthetic.echo": "1"}
+# v0.8.0 provider-role binding (separation of duties): executor routes implement, reviewer routes
+# design/review. A route may never act in the other role.
+EXECUTOR_ROUTES = {"claude-session", "claude-api", "github-executor", "mock"}
+REVIEWER_ROUTES = {"openai-api", "chatgpt-session", "mock-reviewer"}
+ALLOWED_ROUTES = EXECUTOR_ROUTES | REVIEWER_ROUTES
+ENVELOPE_OPS = {"propose", "revise", "cancel", "claim", "begin", "result", "reconcile",
+                "object", "respond", "review"}
 FORBIDDEN_KEYS = {"authority", "authorized", "authorize", "authorization", "approval", "approve",
                   "approved", "owner", "owner_pin", "auth_nonce", "nonce"}
-TERMINAL = {"COMPLETED", "REJECTED", "CANCELLED", "EXPIRED", "DENIED", "STOP"}
+TERMINAL = {"COMPLETED", "REJECTED", "CANCELLED", "EXPIRED", "DENIED", "STOP", "PARTIAL"}
 STATES = ["PROPOSED", "AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCH_PENDING", "DISPATCHED",
-          "CLAIMED", "RUNNING", "RESULT_PERSISTED", "VERIFIED", "COMPLETED",
-          "REJECTED", "CANCELLED", "EXPIRED", "DENIED", "STOP", "UNKNOWN_RECONCILE"]
+          "CLAIMED", "RUNNING", "RESULT_PERSISTED", "VERIFIED", "REVIEWING", "COMPLETED",
+          "REJECTED", "CANCELLED", "EXPIRED", "DENIED", "STOP", "PARTIAL", "DISAGREEMENT",
+          "UNKNOWN_RECONCILE"]
+
+# ---- R3: transaction/stage-scoped capability policy (role x op x stage); see check in Engine._cap
+ROLE_CAPS = {
+    "designer": {"propose", "revise", "cancel", "object", "respond"},
+    "executor": {"claim", "begin", "result", "object", "respond"},
+    "reviewer": {"review", "object", "respond"},          # read-oriented: no mutation caps
+    "reconciler": {"reconcile"},
+}
+MUTATING_OPS = {"propose", "revise", "cancel", "claim", "begin", "result", "reconcile"}
+OP_STAGES = {   # op -> {role: allowed transaction states}; None = transaction must not exist
+    "propose": {"designer": None},
+    "revise": {"designer": {"PROPOSED", "AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCH_PENDING", "DISPATCHED"}},
+    "cancel": {"designer": {"PROPOSED", "AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCH_PENDING", "DISPATCHED",
+                            "CLAIMED", "DISAGREEMENT"}},
+    "claim": {"executor": {"DISPATCHED"}},
+    "begin": {"executor": {"CLAIMED"}},
+    "result": {"executor": {"RUNNING"}},
+    "review": {"reviewer": {"REVIEWING"}},
+    "object": {"designer": {"AWAITING_AUTHORITY"},
+               "executor": {"AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCHED", "CLAIMED"},
+               "reviewer": {"REVIEWING"}},
+    "respond": {"designer": {"DISAGREEMENT"}, "executor": {"DISAGREEMENT"}, "reviewer": {"DISAGREEMENT"}},
+    "reconcile": {"reconciler": {"UNKNOWN_RECONCILE"}},
+}
+
+# ---- anti-assumption fact classification
+FACT_STATUS = {"ACCEPTED_EVIDENCE", "FRESH_OBSERVATION", "INFERENCE", "UNKNOWN", "AUTHORITY",
+               "EXECUTION_EVIDENCE", "VERIFICATION_EVIDENCE"}
+ACCEPTANCE_BASIS = {"VERIFICATION_EVIDENCE", "EXECUTION_EVIDENCE", "FRESH_OBSERVATION"}
+VERIFY_PREDICATES = {"echo_equals_value", "bound_txn", "bound_proposal", "bound_package"}
+
+# ---- per-transaction budgets (gaop.budget.v1): defaults, and policy ceilings a proposal may not exceed
+BUDGET_KEYS = ("elapsed_s", "provider_calls", "tool_calls", "retrieval_bytes", "input_tokens",
+               "output_tokens", "retries", "reconciliation_rounds", "stages")
+BUDGET_DEFAULT = {"elapsed_s": 900, "provider_calls": 4, "tool_calls": 30, "retrieval_bytes": 65536,
+                  "input_tokens": 8000, "output_tokens": 1500, "retries": 0, "reconciliation_rounds": 1,
+                  "stages": 30}
+BUDGET_MAX = {"elapsed_s": 3600, "provider_calls": 6, "tool_calls": 60, "retrieval_bytes": 262144,
+              "input_tokens": 20000, "output_tokens": 4000, "retries": 1, "reconciliation_rounds": 1,
+              "stages": 40}
+
+# ---- liveness: bounded stage timeouts (seconds); heartbeat period
+HEARTBEAT_SECONDS = 5
+STAGE_TIMEOUTS = {"DISPATCH_PENDING": 30, "RUNNING": 90, "RESULT_PERSISTED": 60, "VERIFIED": 120,
+                  "REVIEWING": 150}
+FLOW = ["AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCH_PENDING", "DISPATCHED", "CLAIMED", "RUNNING",
+        "RESULT_PERSISTED", "VERIFIED", "REVIEWING", "COMPLETED"]
 TXN_RE = re.compile(r"^TXN-[A-Z0-9][A-Z0-9-]{2,40}$")
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
@@ -78,10 +132,11 @@ def log(msg):
 
 
 class Denied(Exception):
-    def __init__(self, code, detail=""):
+    def __init__(self, code, detail="", extra=None):
         super().__init__("%s %s" % (code, detail))
         self.code = code
         self.detail = detail
+        self.extra = extra or {}
 
 
 # ============================== versioned store ==============================
@@ -94,7 +149,7 @@ class Store:
 
     def __init__(self, root):
         self.root = root
-        for d in ("", "txn", "seen", "cred"):
+        for d in ("", "txn", "seen", "cred", "ops"):
             os.makedirs(os.path.join(root, d), exist_ok=True)
         os.chmod(os.path.join(root, "cred"), 0o700)
         self._lockf = open(os.path.join(root, ".lock"), "a+")
@@ -155,9 +210,40 @@ class Store:
             raise Denied("CAS_CONFLICT", "expected %s found %s" % (expected_version, cur_v))
         rec["state_version"] = expected_version + 1
         rec["updated"] = now()
+        # v0.8.0 verified checkpoint: every committed transition is a checkpoint that is literally
+        # read back before it counts; resume only ever starts from a verified checkpoint.
+        cp = {"state_version": rec["state_version"], "stage": rec["state"],
+              "at": rec.get("stage_entered") or rec["updated"]}
+        rec["last_checkpoint"] = cp
+        self._atomic(self._tp(rec["txn_id"]), rec)
+        if canon(self.get(rec["txn_id"])) != canon(rec):
+            raise Denied("CHECKPOINT_VERIFY_FAILED", rec["txn_id"])
+        rec["last_checkpoint"]["verified"] = True
         self._atomic(self._tp(rec["txn_id"]), rec)
         self._index(rec)
         return rec
+
+    # ---- R2: operation-identity registry (terminal operations; repeat-work protection)
+    def op_get(self, op_id):
+        p = os.path.join(self.root, "ops", op_id + ".json")
+        return json.load(open(p)) if os.path.exists(p) else None
+
+    def op_put(self, op_id, obj):
+        self._atomic(os.path.join(self.root, "ops", op_id + ".json"), obj)
+
+    def live_put(self, obj):
+        self._atomic(os.path.join(self.root, "live.json"), obj)
+
+    def live_get(self):
+        p = os.path.join(self.root, "live.json")
+        return json.load(open(p)) if os.path.exists(p) else {}
+
+    def stats_get(self):
+        p = os.path.join(self.root, "stats.json")
+        return json.load(open(p)) if os.path.exists(p) else {}
+
+    def stats_put(self, obj):
+        self._atomic(os.path.join(self.root, "stats.json"), obj)
 
     def _index(self, rec):
         ap = os.path.join(self.root, "active.json")
@@ -190,17 +276,67 @@ class Store:
         return json.load(open(os.path.join(self.root, "seen", key)))
 
 
-def transition(rec, new_state, note=""):
+def transition(rec, new_state, note="", at=None):
     if new_state not in STATES:
         raise Denied("BAD_STATE", new_state)
-    rec["history"] = (rec.get("history", []) + [[now(), rec["state"], new_state, note[:80]]])[-40:]
+    at = now() if at is None else at
+    rec["history"] = (rec.get("history", []) + [[at, rec["state"], new_state, note[:80]]])[-40:]
     rec["state"] = new_state
+    rec["stage_entered"] = at
+    b = rec.get("budget")
+    if b:
+        b["used"]["stages"] = b["used"].get("stages", 0) + 1
     return rec
 
 
 def proposal_hash(txn_id, revision, proposal):
     return sha(canon({"protocol": PROTOCOL, "txn_id": txn_id, "revision": revision,
                       "proposal": proposal}))
+
+
+# ============================== R1: exact executable package ==============================
+def operation_identity(p):
+    """Deterministic operation identity (R2): the same operation on the same target/value/scope/route
+    has the same identity regardless of transaction ID, envelope bytes or timing."""
+    return sha(canon({"op": p["op"], "op_version": OP_VERSIONS[p["op"]], "target": p["target"],
+                      "value": p["value"], "scope": p["scope"], "route": p["route"]}))[:32]
+
+
+def resolve_budgets(req):
+    req = req or {}
+    if not isinstance(req, dict) or set(req) - set(BUDGET_KEYS):
+        raise Denied("MALFORMED", "budgets")
+    out = dict(BUDGET_DEFAULT)
+    for k, v in req.items():
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise Denied("MALFORMED", "budget " + k)
+        if v > BUDGET_MAX[k]:
+            raise Denied("BUDGET_ABOVE_POLICY", "%s %d > %d" % (k, v, BUDGET_MAX[k]))
+        out[k] = v
+    return out
+
+
+def build_exec_package(txn_id, revision, p, expires_at, pkg_nonce):
+    """Deterministic representation of the authorised executable package. Every material field is
+    inside the digest: any change produces a different digest and invalidates prior authority."""
+    return {"schema": "gaop.exec_package.v1", "protocol": PROTOCOL, "store_schema": STORE_SCHEMA,
+            "op_version": OP_VERSIONS[p["op"]], "txn_id": txn_id, "revision": revision,
+            "operation": p["op"], "targets": [p["target"]], "parameters": p["value"],
+            "scope": p["scope"],
+            "constraints": {"effect": p["effect"], "route": p["route"],
+                            "review_route": p.get("review_route", "openai-api"),
+                            "evidence": p.get("evidence", "none")},
+            "preservation": list(p.get("preserve", [])), "budgets": resolve_budgets(p.get("budgets")),
+            "verification": sorted(p.get("verify", sorted(VERIFY_PREDICATES))),
+            "nonce": pkg_nonce, "expires_at": expires_at, "operation_id": operation_identity(p)}
+
+
+def package_digest(pkg):
+    return sha(canon(pkg))
+
+
+def authority_body_digest(a):
+    return sha(canon({k: v for k, v in a.items() if k != "authority_sha256"}))
 
 
 # ============================== envelope validation ==============================
@@ -240,19 +376,55 @@ def parse_envelope(raw):
         raise Denied("MALFORMED", "envelope_id")
     if not TXN_RE.match(str(env.get("txn_id", ""))):
         raise Denied("MALFORMED", "txn_id")
+    if env.get("role") not in ROLE_CAPS:                      # v0.8.0: explicit actor role (R3)
+        raise Denied("MALFORMED", "role")
     return env
+
+
+def validate_facts(facts):
+    """Anti-assumption: critical facts are classified; providers can never assert AUTHORITY, and a
+    critical fact that is only inference/unknown cannot become part of an executable package."""
+    if facts is None:
+        return
+    if not isinstance(facts, list) or len(facts) > 8:
+        raise Denied("MALFORMED", "facts")
+    for f in facts:
+        if not isinstance(f, dict) or set(f) - {"k", "v", "status", "critical"} or f.get("status") not in FACT_STATUS:
+            raise Denied("MALFORMED", "fact")
+        if f["status"] == "AUTHORITY":
+            raise Denied("PROVIDER_AUTHORITY_CLAIM", "facts cannot carry authority")
+        if f.get("critical") and f["status"] in ("INFERENCE", "UNKNOWN"):
+            raise Denied("CRITICAL_FACT_UNVERIFIED", str(f.get("k"))[:40])
 
 
 def validate_proposal(p):
     if not isinstance(p, dict):
         raise Denied("MALFORMED", "proposal")
     need = {"op", "target", "value", "scope", "effect", "summary", "ttl_seconds", "route"}
-    if set(p) - (need | {"evidence"}) or not need <= set(p):
+    opt = {"evidence", "review_route", "preserve", "budgets", "verify", "facts"}
+    if set(p) - (need | opt) or not need <= set(p):
         raise Denied("MALFORMED", "proposal fields")
     if p["op"] not in ALLOWED_OPS:
         raise Denied("OP_NOT_ALLOWLISTED", str(p["op"])[:40])
     if p["route"] not in ALLOWED_ROUTES:
         raise Denied("ROUTE_NOT_ALLOWED", str(p["route"])[:40])
+    # provider-role enforcement: the executor route must be an implementer; the reviewer must be a
+    # reviewer route of a different vendor (separation of duties).
+    if p["route"] not in EXECUTOR_ROUTES:
+        raise Denied("PROVIDER_ROLE_VIOLATION", "%s cannot execute" % p["route"])
+    rr = p.get("review_route", "openai-api")
+    if rr not in REVIEWER_ROUTES:
+        raise Denied("PROVIDER_ROLE_VIOLATION", "%s cannot review" % str(rr)[:40])
+    if (rr == "mock-reviewer") != (p["route"] == "mock"):
+        raise Denied("PROVIDER_ROLE_VIOLATION", "mock reviewer only with mock executor")
+    if not isinstance(p.get("preserve", []), list) or len(p.get("preserve", [])) > 5 or \
+            any(not isinstance(x, str) or len(x) > 80 for x in p.get("preserve", [])):
+        raise Denied("MALFORMED", "preserve")
+    v = p.get("verify", sorted(VERIFY_PREDICATES))
+    if not isinstance(v, list) or not v or set(v) - VERIFY_PREDICATES:
+        raise Denied("MALFORMED", "verify")
+    resolve_budgets(p.get("budgets"))
+    validate_facts(p.get("facts"))
     if p.get("evidence", "none") not in ("none", "drive"):
         raise Denied("MALFORMED", "evidence")
     if not isinstance(p["ttl_seconds"], int) or not 60 <= p["ttl_seconds"] <= MAX_TTL_SECONDS:
@@ -356,21 +528,30 @@ def http_transport(url, headers, body, timeout):
         raise ProviderError("UNCERTAIN", type(ex).__name__)
 
 
-def call_provider(route, cred, payload, transport, timeout=PROVIDER_TIMEOUT):
-    pv = PROVIDERS[route]
+REVIEW_SYSTEM = ("You are the GAOP independent Designer/Reviewer (problem checker). You never execute and "
+                 "never grant authority. Judge ONLY the supplied compact machine payload. Reply with ONLY one "
+                 "compact JSON object and no other text.")
+
+
+def call_provider(route, cred, payload, transport, timeout=PROVIDER_TIMEOUT, max_tokens=300):
     user = ("Return exactly this JSON object, copying every value unchanged: "
             + json.dumps({"echo": payload["value"], "txn_id": payload["txn_id"],
                           "proposal_sha256": payload["proposal_sha256"],
                           "correlation_id": payload["correlation_id"]}, sort_keys=True))
+    return provider_request(route, cred, EXEC_SYSTEM, user, transport, timeout, max_tokens)
+
+
+def provider_request(route, cred, system, user, transport, timeout=PROVIDER_TIMEOUT, max_tokens=300):
+    pv = PROVIDERS[route]
     if pv["vendor"] == "anthropic":
         headers = {"x-api-key": cred["api_key"], "anthropic-version": "2023-06-01",
                    "content-type": "application/json"}
-        body = {"model": cred["model"], "max_tokens": 300, "system": EXEC_SYSTEM,
+        body = {"model": cred["model"], "max_tokens": max_tokens, "system": system,
                 "messages": [{"role": "user", "content": user}]}
     else:
         headers = {"Authorization": "Bearer " + cred["api_key"], "Content-Type": "application/json"}
-        body = {"model": cred["model"], "messages": [{"role": "system", "content": EXEC_SYSTEM},
-                                                     {"role": "user", "content": user}]}
+        body = {"model": cred["model"], "max_completion_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     status, rh, raw = transport(pv["url"], headers, json.dumps(body).encode(), timeout)
     if status in (401, 403):
         raise ProviderError("AUTH", "http %d" % status)
@@ -414,6 +595,36 @@ def parse_provider_json(text):
     return o
 
 
+def extract_json(text, need):
+    t = (text or "").strip()
+    a, b = t.find("{"), t.rfind("}")
+    if a < 0 or b <= a:
+        raise ProviderError("MALFORMED", "no JSON object in provider text")
+    try:
+        o = json.loads(t[a:b + 1])
+    except Exception:
+        raise ProviderError("MALFORMED", "provider JSON not parseable")
+    if not isinstance(o, dict) or not set(need) <= set(o):
+        raise ProviderError("MALFORMED", "provider JSON missing required fields")
+    return o
+
+
+def review_prompt(kind, payload):
+    """Compact machine instruction for the OpenAI Designer/Reviewer. kind: design | verify."""
+    if kind == "design":
+        ask = ('Problem-check this proposed bounded transaction before owner authorization. Return '
+               '{"verdict":"NO_OBJECTION"|"DISAGREE_DESIGN","issue_code":"<UPPER_SNAKE or NONE>",'
+               '"claim":"<=200 chars","evidence_status":"FRESH_OBSERVATION"|"INFERENCE"|"UNKNOWN",'
+               '"txn_id":<copy>,"package_digest":<copy>,"correlation_id":<copy>}.')
+    else:
+        ask = ('Independently verify the executed result against the authorised package and the '
+               'deterministic verification evidence. ACCEPT only if the evidence shows every predicate holds. '
+               'Return {"verdict":"ACCEPT"|"DISAGREE_VERIFICATION","issue_code":"<UPPER_SNAKE or NONE>",'
+               '"claim":"<=200 chars","evidence_status":"VERIFICATION_EVIDENCE"|"INFERENCE"|"UNKNOWN",'
+               '"txn_id":<copy>,"package_digest":<copy>,"correlation_id":<copy>}.')
+    return ask + " PAYLOAD=" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
 class ApiAdapter(Adapter):
     """claude-api / openai-api: machine-addressable provider routes. Requires a provider
     credential in App-private /data (one-time SETUP). Absent credential -> fail closed (STOP)."""
@@ -439,16 +650,140 @@ def adapter_for(route, store):
 
 # ============================== engine ==============================
 class Engine:
-    def __init__(self, store, adapters=None, clock=now, transport=None):
+    """v0.8.0 production engine. R1 exact package/authority binding, R2 operation identity /
+    one-time authority / verified checkpoints, R3 role x op x stage capability scoping, budgets,
+    liveness, dual-AI design/review with bounded disagreement and anti-assumption controls."""
+
+    def __init__(self, store, adapters=None, clock=now, transport=None, async_review=False):
         self.s = store
         self.adapters = adapters or {}
         self.clock = clock
         self.transport = transport
+        self.async_review = async_review
+        self._after = []
+
+    # ---------- small helpers ----------
+    def _tr(self, rec, state, note=""):
+        return transition(rec, state, note, at=self.clock())
+
+    def _defer(self, fn, *a):
+        self._after.append((fn, a))
+
+    def _run_deferred(self):
+        while self._after:
+            fn, a = self._after.pop(0)
+            if self.async_review:
+                threading.Thread(target=self._safe, args=(fn, a), daemon=True).start()
+            else:
+                self._safe(fn, a)
+
+    def _safe(self, fn, a):
+        try:
+            out = fn(*a)
+            log("STAGE %s %s -> %s" % (fn.__name__, a[0] if a else "", json.dumps(out, sort_keys=True)))
+        except Denied as d:
+            log("STAGE %s %s denied %s" % (fn.__name__, a[0] if a else "", d.code))
+        except Exception as ex:                      # never leave an invisible failure: watchdog settles it
+            log("STAGE %s %s error class=%s" % (fn.__name__, a[0] if a else "", type(ex).__name__))
+        self._run_deferred()
+
+    # ---------- budgets ----------
+    def _exhausted(self, rec):
+        b = rec.get("budget")
+        if not b:
+            return None
+        lim, used = b["limits"], b["used"]
+        if b.get("started") is not None and self.clock() - b["started"] > lim["elapsed_s"]:
+            return "elapsed_s"
+        for k in BUDGET_KEYS:
+            if k != "elapsed_s" and used.get(k, 0) > lim[k]:
+                return k
+        return None
+
+    def _charge(self, rec, key, n=1):
+        b = rec.get("budget")
+        if b:
+            b["used"][key] = b["used"].get(key, 0) + n
+
+    def _enforce_budget(self, rec):
+        """Budget exhaustion never silently continues: pre-result -> STOP, post-result -> PARTIAL."""
+        k = self._exhausted(rec)
+        if k is None:
+            return
+        v = rec["state_version"]
+        if rec["state"] not in TERMINAL and rec["state"] != "UNKNOWN_RECONCILE":
+            if rec["state"] == "RUNNING":
+                rec["reconcile"] = {"reason": "BUDGET_EXHAUSTED_MIDRUN " + k, "at": self.clock()}
+                self._tr(rec, "UNKNOWN_RECONCILE", "budget %s exhausted mid-execution" % k)
+            elif rec.get("result"):
+                self._tr(rec, "PARTIAL", "budget %s exhausted after result" % k)
+                rec["receipt"] = self.make_receipt(rec, "PARTIAL")
+            else:
+                rec["authority"] = None
+                self._tr(rec, "STOP", "budget %s exhausted" % k)
+            rec["budget"]["exhausted"] = k
+            self.s.put(rec, v)
+            self._register_op(rec)
+        raise Denied("BUDGET_EXHAUSTED", k)
+
+    # ---------- R3 capability scoping ----------
+    def _cap(self, env, rec):
+        """Capability = role x operation x stage x transaction (x target/package for executor ops).
+        Every route (POST /control, option envelope, direct method call) passes through here."""
+        role, op = env.get("role"), env.get("op")
+        if role not in ROLE_CAPS:
+            raise Denied("MALFORMED", "role")
+        if op not in ROLE_CAPS[role]:
+            if role == "reviewer" and op in MUTATING_OPS:
+                raise Denied("REVIEWER_MUTATION_DENIED", op)
+            raise Denied("CAPABILITY_DENIED", "%s may not %s" % (role, op))
+        stages = OP_STAGES[op][role]
+        if stages is None:
+            return
+        if rec is None:
+            raise Denied("UNKNOWN_TXN", env.get("txn_id", ""))
+        if rec["state"] in ("COMPLETED", "PARTIAL") and op in ("claim", "begin", "result", "review"):
+            raise Denied("ALREADY_TERMINAL", rec["state"],
+                         extra={"existing": {"state": rec["state"],
+                                             "receipt_sha256": (rec.get("receipt") or {}).get("receipt_sha256")}})
+        if rec["state"] not in stages:
+            raise Denied("WRONG_STAGE", "%s %s in %s" % (role, op, rec["state"]))
+        if op in ("claim", "begin", "result", "object", "respond", "review", "revise", "cancel"):
+            self._charge(rec, "tool_calls")
+            self._enforce_budget(rec)
+
+    # ---------- R1 binding ----------
+    def _check_binding(self, rec, consume=False):
+        """Before consequential execution the persisted package must equal the authority digest.
+        Executes the authorised package, never a regenerated substitute."""
+        a = rec.get("authority")
+        if not a:
+            raise Denied("AUTHORITY_MISSING", rec["txn_id"])
+        if authority_body_digest(a) != a.get("authority_sha256"):
+            raise Denied("AUTHORITY_INVALID", "authority record integrity")
+        if self.clock() > a["expires_at"]:
+            raise Denied("AUTHORITY_EXPIRED", rec["txn_id"])
+        pkg = rec.get("exec_package")
+        if not pkg or package_digest(pkg) != rec.get("package_digest") or a.get("package_digest") != rec.get("package_digest"):
+            raise Denied("PACKAGE_DIGEST_MISMATCH", rec["txn_id"])
+        if a.get("txn_id") != rec["txn_id"] or a.get("proposal_sha256") != rec["proposal_sha256"]:
+            raise Denied("AUTHORITY_BINDING_MISMATCH", rec["txn_id"])
+        if consume:
+            if rec.get("authority_use"):
+                raise Denied("AUTHORITY_CONSUMED", rec["authority_use"].get("by", ""))
+        return pkg
+
+    def _stop_binding(self, rec, d):
+        v = rec["state_version"]
+        rec["authority"] = None
+        rec["binding_failure"] = d.code
+        self._tr(rec, "STOP", "binding check failed: " + d.code)
+        self.s.put(rec, v)
 
     # ---------- control ingress ----------
     def apply_envelope(self, raw):
-        """Returns an outcome dict. Idempotent per envelope digest: a replayed envelope has no
-        second effect (returns the recorded outcome)."""
+        """Idempotent per envelope digest (replay returns the recorded outcome, no second effect);
+        an envelope_id reused with different bytes is a duplicate control envelope and is rejected."""
         b = raw.encode() if isinstance(raw, str) else (raw or b"")
         key = "env-" + sha(b)
         self.s.lock()
@@ -461,15 +796,21 @@ class Engine:
                 env = parse_envelope(raw)
                 if env is None:
                     return {"outcome": "NOOP"}
+                ek = "eid-" + sha(("%s|%s" % (env["txn_id"], env["envelope_id"])).encode())
+                if self.s.seen(ek):
+                    raise Denied("DUPLICATE_ENVELOPE", env["envelope_id"])
+                self.s.mark_seen(ek, {"envelope_sha256": key[4:]})
                 out = getattr(self, "_op_" + env["op"])(env)
                 out.update(outcome="ACCEPTED", op=env["op"], txn_id=env["txn_id"])
             except Denied as d:
                 out = {"outcome": "DENIED", "code": d.code, "detail": d.detail[:120]}
+                out.update(d.extra)
             out["envelope_sha256"] = key[4:]
             self.s.mark_seen(key, out)
             return out
         finally:
             self.s.unlock()
+            self._run_deferred()
 
     def _load(self, txn_id, expect=None):
         rec = self.s.get(txn_id)
@@ -481,39 +822,55 @@ class Engine:
         return rec
 
     def _expire(self, rec):
-        if rec["state"] in ("AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCH_PENDING", "DISPATCHED") \
+        if rec["state"] in ("AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCH_PENDING", "DISPATCHED", "DISAGREEMENT") \
                 and self.clock() > rec["expires_at"]:
             v = rec["state_version"]
-            transition(rec, "EXPIRED", "expiry reached before execution")
+            self._tr(rec, "EXPIRED", "expiry reached before execution")
             rec["authority"] = None
             self.s.put(rec, v)
             raise Denied("EXPIRED", rec["txn_id"])
 
+    def _new_package(self, rec):
+        p = rec["proposal"]
+        rec["pkg_nonce"] = secrets.token_hex(12)
+        rec["exec_package"] = build_exec_package(rec["txn_id"], rec["revision"], p, rec["expires_at"], rec["pkg_nonce"])
+        rec["package_digest"] = package_digest(rec["exec_package"])
+        rec["operation_id"] = rec["exec_package"]["operation_id"]
+
     def _op_propose(self, env):
+        self._cap(env, None)
         txn_id = env["txn_id"]
         if self.s.get(txn_id) is not None:
             raise Denied("DUPLICATE_TXN", txn_id)
         if len([t for t in self.s.active()]) >= MAX_ACTIVE:
             raise Denied("CAPACITY", "too many active transactions")
         p = validate_proposal(env.get("proposal"))
-        rec = {"protocol": PROTOCOL, "store_schema": STORE_SCHEMA, "txn_id": txn_id,
-               "state": "PROPOSED", "created": self.clock(), "revision": 1, "proposal": p,
+        op_id = operation_identity(p)
+        prior = self.s.op_get(op_id)
+        cc = env.get("changed_condition")
+        if prior and prior.get("state") in ("COMPLETED", "PARTIAL") and not (isinstance(cc, str) and 3 <= len(cc) <= 200):
+            # R2: a repeated completed request returns the existing terminal/receipt state; only a
+            # stated material changed condition (plus fresh owner authority) creates a new transaction.
+            raise Denied("DUPLICATE_OPERATION", prior["txn_id"], extra={"existing": prior})
+        t0 = self.clock()
+        rec = {"protocol": PROTOCOL, "store_schema": STORE_SCHEMA, "gaop_version": VERSION, "txn_id": txn_id,
+               "state": "PROPOSED", "created": t0, "revision": 1, "proposal": p,
                "proposal_sha256": proposal_hash(txn_id, 1, p),
-               "expires_at": self.clock() + p["ttl_seconds"], "authority": None,
+               "expires_at": t0 + p["ttl_seconds"], "authority": None, "authority_use": None,
                "pending_nonce": secrets.token_hex(16), "used_nonces": [], "dispatch": None,
                "claim": None, "execution": None, "result": None, "receipt": None,
-               "evidence": None, "reconcile": None, "history": []}
-        transition(rec, "AWAITING_AUTHORITY", "proposal persisted")
+               "evidence": None, "reconcile": None, "history": [], "design_review": None,
+               "review": None, "disagreement": None, "changed_condition": cc if prior else None,
+               "budget": {"limits": resolve_budgets(p.get("budgets")), "started": None,
+                          "used": {k: 0 for k in BUDGET_KEYS if k != "elapsed_s"}},
+               "origin": "control-envelope"}
+        self._new_package(rec)
+        self._tr(rec, "AWAITING_AUTHORITY", "proposal persisted")
         self.s.put(rec, 0)
-        return {"state": rec["state"], "proposal_sha256": rec["proposal_sha256"]}
+        return {"state": rec["state"], "proposal_sha256": rec["proposal_sha256"],
+                "package_digest": rec["package_digest"], "operation_id": rec["operation_id"]}
 
-    def _op_revise(self, env):
-        rec = self._load(env["txn_id"], {"PROPOSED", "AWAITING_AUTHORITY", "AUTHORIZED",
-                                          "DISPATCH_PENDING", "DISPATCHED"})
-        if env.get("base_state_version") != rec["state_version"]:
-            raise Denied("CAS_CONFLICT", "base_state_version")
-        p = validate_proposal(env.get("proposal"))
-        v = rec["state_version"]
+    def _apply_revision(self, rec, p, note):
         rec["revision"] += 1
         rec["proposal"] = p
         rec["proposal_sha256"] = proposal_hash(rec["txn_id"], rec["revision"], p)
@@ -523,9 +880,21 @@ class Engine:
         rec["pending_nonce"] = secrets.token_hex(16)
         rec["authority"] = None          # material revision invalidates prior authority
         rec["dispatch"] = None
-        transition(rec, "AWAITING_AUTHORITY", "revised r%d; prior authority invalidated" % rec["revision"])
+        rec["design_review"] = None
+        self._new_package(rec)
+        self._tr(rec, "AWAITING_AUTHORITY", note)
+
+    def _op_revise(self, env):
+        rec = self._load(env["txn_id"])
+        self._cap(env, rec)
+        if env.get("base_state_version") != rec["state_version"]:
+            raise Denied("CAS_CONFLICT", "base_state_version")
+        p = validate_proposal(env.get("proposal"))
+        v = rec["state_version"]
+        self._apply_revision(rec, p, "revised r%d; prior authority invalidated" % (rec["revision"] + 1))
         self.s.put(rec, v)
-        return {"state": rec["state"], "proposal_sha256": rec["proposal_sha256"], "revision": rec["revision"]}
+        return {"state": rec["state"], "proposal_sha256": rec["proposal_sha256"], "revision": rec["revision"],
+                "package_digest": rec["package_digest"]}
 
     def _op_cancel(self, env):
         rec = self._load(env["txn_id"])
@@ -533,9 +902,10 @@ class Engine:
             raise Denied("WRONG_STATE", rec["state"])
         if rec["state"] in ("RUNNING", "RESULT_PERSISTED", "UNKNOWN_RECONCILE"):
             raise Denied("WRONG_STATE", "cannot cancel in %s; reconcile required" % rec["state"])
+        self._cap(env, rec)
         v = rec["state_version"]
         rec["authority"] = None
-        transition(rec, "CANCELLED", "cancelled by control envelope")
+        self._tr(rec, "CANCELLED", "cancelled by control envelope")
         self.s.put(rec, v)
         return {"state": "CANCELLED"}
 
@@ -547,30 +917,42 @@ class Engine:
         if c and rec["state"] in ("CLAIMED", "RUNNING"):
             if self.clock() > c["lease_until"]:
                 v = rec["state_version"]
-                rec["reconcile"] = {"reason": "STALE_LEASE", "prior_claim": c["claim_id"],
-                                    "at": self.clock()}
-                transition(rec, "UNKNOWN_RECONCILE", "stale lease; no implicit takeover")
+                rec["reconcile"] = {"reason": "STALE_LEASE", "prior_claim": c["claim_id"], "at": self.clock()}
+                self._tr(rec, "UNKNOWN_RECONCILE", "stale lease; no implicit takeover")
                 self.s.put(rec, v)
                 raise Denied("STALE_LEASE_RECONCILE", c["claim_id"])
             raise Denied("ALREADY_CLAIMED", c["claim_id"])
-        rec = self._load(env["txn_id"], {"DISPATCHED"})
+        rec = self._load(env["txn_id"])
+        self._cap(env, rec)
         if rec["proposal"]["route"] in PROVIDERS:
             raise Denied("ADAPTER_OWNED_ROUTE", "API-route transactions are executed only by the App adapter")
         if env.get("package_sha256") != rec["dispatch"]["package_sha256"]:
             raise Denied("HASH_MISMATCH", "package_sha256")
+        # R3 target/scope binding: the claimed capability must name this exact operation/target/package
+        if env.get("package_digest") != rec["package_digest"]:
+            raise Denied("PACKAGE_DIGEST_MISMATCH", "claim")
+        if env.get("operation") != rec["exec_package"]["operation"] or env.get("target") not in rec["exec_package"]["targets"]:
+            raise Denied("SCOPE_MISMATCH", "operation/target")
         ex = str(env.get("executor", ""))
         if not ID_RE.match(ex):
             raise Denied("MALFORMED", "executor")
+        try:
+            self._check_binding(rec, consume=True)
+        except Denied as d:
+            if d.code != "AUTHORITY_CONSUMED":
+                self._stop_binding(rec, d)
+            raise
         v = rec["state_version"]
         rec["claim"] = {"claim_id": "clm-" + secrets.token_hex(8), "executor": ex,
                         "claimed_at": self.clock(), "lease_until": self.clock() + LEASE_SECONDS}
-        transition(rec, "CLAIMED", "claimed by " + ex)
+        rec["authority_use"] = {"consumed_at": self.clock(), "by": ex, "stage": "claim"}
+        self._tr(rec, "CLAIMED", "claimed by " + ex)
         self.s.put(rec, v)
-        return {"state": "CLAIMED", "claim_id": rec["claim"]["claim_id"],
-                "lease_until": rec["claim"]["lease_until"]}
+        return {"state": "CLAIMED", "claim_id": rec["claim"]["claim_id"], "lease_until": rec["claim"]["lease_until"]}
 
-    def _claimed(self, env, states):
-        rec = self._load(env["txn_id"], states)
+    def _claimed(self, env):
+        rec = self._load(env["txn_id"])
+        self._cap(env, rec)
         if rec["proposal"]["route"] in PROVIDERS:
             raise Denied("ADAPTER_OWNED_CLAIM", "claim held by the App provider adapter")
         c = rec.get("claim") or {}
@@ -578,24 +960,28 @@ class Engine:
             raise Denied("NOT_CLAIM_HOLDER", "claim_id")
         if self.clock() > c.get("lease_until", 0):
             v = rec["state_version"]
-            rec["reconcile"] = {"reason": "STALE_LEASE", "prior_claim": c.get("claim_id"),
-                                "at": self.clock()}
-            transition(rec, "UNKNOWN_RECONCILE", "lease expired mid-execution")
+            rec["reconcile"] = {"reason": "STALE_LEASE", "prior_claim": c.get("claim_id"), "at": self.clock()}
+            self._tr(rec, "UNKNOWN_RECONCILE", "lease expired mid-execution")
             self.s.put(rec, v)
             raise Denied("STALE_LEASE_RECONCILE", c.get("claim_id", ""))
         return rec
 
     def _op_begin(self, env):
-        rec = self._claimed(env, {"CLAIMED"})
+        rec = self._claimed(env)
+        try:
+            self._check_binding(rec)
+        except Denied as d:
+            self._stop_binding(rec, d)
+            raise
         v = rec["state_version"]
         rec["execution"] = {"started_at": self.clock(), "maybe_write": True,
-                            "action_id": rec["dispatch"]["action_id"]}
-        transition(rec, "RUNNING", "execution started (maybe-write marker set)")
+                            "action_id": rec["dispatch"]["action_id"], "package_digest": rec["package_digest"]}
+        self._tr(rec, "RUNNING", "execution started (maybe-write marker set)")
         self.s.put(rec, v)
         return {"state": "RUNNING"}
 
     def _op_result(self, env):
-        rec = self._claimed(env, {"RUNNING"})
+        rec = self._claimed(env)
         res = env.get("result")
         rb = canon(res)
         if len(rb) > MAX_RESULT_BYTES:
@@ -604,17 +990,17 @@ class Engine:
             raise Denied("RESULT_HASH_MISMATCH", "result_sha256")
         v = rec["state_version"]
         rec["result"] = {"result": res, "result_sha256": sha(rb), "persisted_at": self.clock(),
-                         "executor": rec["claim"]["executor"]}
+                         "executor": rec["claim"]["executor"], "package_digest": rec["package_digest"]}
         rec["execution"]["maybe_write"] = False
-        transition(rec, "RESULT_PERSISTED", "result persisted")
+        self._tr(rec, "RESULT_PERSISTED", "result persisted")
         self.s.put(rec, v)
-        return self._verify_and_close(rec["txn_id"])
+        return self._verify(rec["txn_id"])
 
     def _op_reconcile(self, env):
         """Governed resolution of UNKNOWN_RECONCILE -> CANCELLED. Allowed only when no result was
-        persisted and no evidence step ran (so no GAOP-side external effect can exist). The
-        interruption record is preserved; the transaction record is never deleted."""
-        rec = self._load(env["txn_id"], {"UNKNOWN_RECONCILE"})
+        persisted and no evidence step ran. The interruption record is preserved."""
+        rec = self._load(env["txn_id"])
+        self._cap(env, rec)
         if env.get("resolution") != "CANCELLED":
             raise Denied("MALFORMED", "resolution must be CANCELLED")
         who = str(env.get("reconciler", ""))
@@ -631,10 +1017,99 @@ class Engine:
                             "provider_status": (rec.get("provider") or {}).get("status")}
         if rec.get("execution"):
             rec["execution"]["maybe_write"] = False
-        transition(rec, "CANCELLED", "reconciled by " + who)
+        self._tr(rec, "CANCELLED", "reconciled by " + who)
         rec["receipt"] = self.make_receipt(rec, "CANCELLED")
         self.s.put(rec, v)
         return {"state": "CANCELLED", "receipt_sha256": rec["receipt"]["receipt_sha256"]}
+
+    # ---------- disagreement (DISAGREE_DESIGN / _IMPLEMENTATION / _VERIFICATION) ----------
+    @staticmethod
+    def _claim_obj(env_or_obj, role):
+        st = env_or_obj.get("evidence_status", "UNKNOWN")
+        if st not in FACT_STATUS:
+            raise Denied("MALFORMED", "evidence_status")
+        if st == "AUTHORITY":
+            raise Denied("PROVIDER_AUTHORITY_CLAIM", role)
+        code = str(env_or_obj.get("issue_code", "UNSPECIFIED"))[:48]
+        return {"role": role, "issue_code": code, "claim": str(env_or_obj.get("claim", ""))[:200],
+                "evidence": str(env_or_obj.get("evidence", ""))[:200], "evidence_status": st}
+
+    def _open_disagreement(self, rec, kind, claim, alt=None, note=""):
+        rec["disagreement"] = {"kind": kind, "issue_code": claim["issue_code"], "opened_at": self.clock(),
+                               "claims": {claim["role"]: claim}, "resume_state": rec["state"],
+                               "agreed_facts": ["txn_id", "package_digest", "proposal_sha256"],
+                               "unknown_facts": [claim["issue_code"]],
+                               "authority_valid": "SUSPENDED" if rec.get("authority") else "NONE",
+                               "alternative": alt, "rounds_used": 0, "outcome": None}
+        rec["pending_nonce"] = rec.get("pending_nonce") or secrets.token_hex(16)
+        self._tr(rec, "DISAGREEMENT", note or kind)
+
+    def _op_object(self, env):
+        rec = self._load(env["txn_id"])
+        self._cap(env, rec)
+        role = env["role"]
+        if role == "reviewer":
+            if env.get("package_digest") != rec["package_digest"]:
+                raise Denied("PACKAGE_DIGEST_MISMATCH", "object")
+            return self._review_verdict(rec, {"verdict": "DISAGREE_VERIFICATION", **{k: env.get(k) for k in
+                                         ("issue_code", "claim", "evidence_status")}}, source="envelope")
+        claim = self._claim_obj(env, role)
+        alt = env.get("alternative")
+        if alt is not None:
+            alt = validate_proposal(alt)
+        kind = "DISAGREE_DESIGN" if role == "designer" else "DISAGREE_IMPLEMENTATION"
+        v = rec["state_version"]
+        self._open_disagreement(rec, kind, claim, alt, "%s objection %s; execution paused" % (role, claim["issue_code"]))
+        self.s.put(rec, v)
+        return {"state": "DISAGREEMENT", "kind": kind}
+
+    def _op_respond(self, env):
+        """One bounded structured reconciliation round by the counterpart role."""
+        rec = self._load(env["txn_id"])
+        self._cap(env, rec)
+        d = rec["disagreement"]
+        counterpart = {"DISAGREE_IMPLEMENTATION": "designer", "DISAGREE_DESIGN": "executor",
+                       "DISAGREE_VERIFICATION": "executor"}[d["kind"]]
+        if env["role"] != counterpart:
+            raise Denied("CAPABILITY_DENIED", "only %s responds to %s" % (counterpart, d["kind"]))
+        if d["kind"] == "DISAGREE_VERIFICATION":
+            raise Denied("WRONG_STAGE", "post-execution disagreement is resolved by the owner")
+        v = rec["state_version"]
+        if d["rounds_used"] >= rec["budget"]["limits"]["reconciliation_rounds"]:
+            d["outcome"] = "UNRESOLVED_USER_DECISION"
+            self.s.put(rec, v)
+            raise Denied("RECONCILIATION_BUDGET_EXHAUSTED", "owner decision required")
+        d["rounds_used"] += 1
+        self._charge(rec, "reconciliation_rounds")
+        d["claims"][env["role"]] = self._claim_obj(env, env["role"])
+        outcome = env.get("outcome")
+        if outcome == "RESOLVED_NO_MATERIAL_CHANGE":
+            # continue only where the authorised scope remains exact (same package digest)
+            if rec.get("authority") and rec["authority"].get("package_digest") != rec["package_digest"]:
+                raise Denied("PACKAGE_DIGEST_MISMATCH", "authority no longer exact")
+            d["outcome"] = outcome
+            self._tr(rec, d["resume_state"], "disagreement resolved; no material change")
+        elif outcome == "RESOLVED_REVISED_PROPOSAL":
+            p = validate_proposal(env.get("proposal"))
+            d["outcome"] = outcome
+            self._apply_revision(rec, p, "disagreement resolved by revision; fresh authority required")
+        elif outcome == "UNRESOLVED":
+            d["outcome"] = "UNRESOLVED_USER_DECISION"
+        else:
+            raise Denied("MALFORMED", "outcome")
+        self.s.put(rec, v)
+        return {"state": rec["state"], "disagreement_outcome": d["outcome"]}
+
+    def _op_review(self, env):
+        """Pull-route ChatGPT reviewer verdict (chatgpt-session). Reviewer role, REVIEWING stage only."""
+        rec = self._load(env["txn_id"])
+        self._cap(env, rec)
+        if rec["proposal"].get("review_route") != "chatgpt-session":
+            raise Denied("ADAPTER_OWNED_REVIEW", "review route is machine adapter")
+        if env.get("package_digest") != rec["package_digest"]:
+            raise Denied("PACKAGE_DIGEST_MISMATCH", "review")
+        o = {k: env.get(k) for k in ("verdict", "issue_code", "claim", "evidence_status")}
+        return self._review_verdict(rec, o, source="envelope")
 
     # ---------- live provider execution (App is the executor for API routes) ----------
     def api_execute(self, txn_id, transport=None):
@@ -645,10 +1120,20 @@ class Engine:
             route = rec["proposal"]["route"]
             if route not in PROVIDERS:
                 raise Denied("NOT_API_ROUTE", route)
+            if route not in EXECUTOR_ROUTES:
+                raise Denied("PROVIDER_ROLE_VIOLATION", route)
+            try:
+                pkg = self._check_binding(rec, consume=True)
+            except Denied as d:
+                if d.code != "AUTHORITY_CONSUMED":
+                    self._stop_binding(rec, d)
+                raise
+            self._charge(rec, "provider_calls")
+            self._enforce_budget(rec)
             cred = load_provider_cred(self.s, route)
             v = rec["state_version"]
             if cred is None:
-                transition(rec, "STOP", "provider not configured")
+                self._tr(rec, "STOP", "provider not configured")
                 self.s.put(rec, v)
                 return {"state": "STOP", "provider": "NOT_CONFIGURED"}
             corr = "corr-" + sha(canon({"txn_id": txn_id, "package_sha256": rec["dispatch"]["package_sha256"],
@@ -656,22 +1141,26 @@ class Engine:
             claim_id = "clm-" + secrets.token_hex(8)
             rec["claim"] = {"claim_id": claim_id, "executor": "%s:%s" % (route, cred["model"]),
                             "claimed_at": self.clock(), "lease_until": self.clock() + LEASE_SECONDS}
-            transition(rec, "CLAIMED", "claimed by App provider adapter " + route)
+            rec["authority_use"] = {"consumed_at": self.clock(), "by": rec["claim"]["executor"], "stage": "api_execute"}
+            self._tr(rec, "CLAIMED", "claimed by App provider adapter " + route)
             rec = self.s.put(rec, v)
             v = rec["state_version"]
-            rec["execution"] = {"started_at": self.clock(), "maybe_write": True,
+            # execute the AUTHORISED package (digest-checked above), never a regenerated substitute
+            payload = {"value": pkg["parameters"], "txn_id": txn_id,
+                       "proposal_sha256": rec["proposal_sha256"], "correlation_id": corr}
+            in_tok = len(json.dumps(payload)) // 4 + 60
+            self._charge(rec, "input_tokens", in_tok)
+            max_out = max(1, min(300, rec["budget"]["limits"]["output_tokens"] - rec["budget"]["used"]["output_tokens"]))
+            rec["execution"] = {"started_at": self.clock(), "maybe_write": True, "package_digest": rec["package_digest"],
                                 "action_id": rec["dispatch"]["action_id"], "correlation_id": corr}
             rec["provider"] = {"route": route, "vendor": PROVIDERS[route]["vendor"], "model": cred["model"],
                                "correlation_id": corr, "sent_at": self.clock(), "status": "SENT"}
-            transition(rec, "RUNNING", "provider request sent (maybe-write marker set)")
+            self._tr(rec, "RUNNING", "provider request sent (maybe-write marker set)")
             rec = self.s.put(rec, v)
-            pkg = rec["dispatch"]["package"]
         finally:
             self.s.unlock()
-        payload = {"value": pkg["proposal"]["value"], "txn_id": txn_id,
-                   "proposal_sha256": pkg["proposal_sha256"], "correlation_id": corr}
         try:
-            resp, err = call_provider(route, cred, payload, tr), None
+            resp, err = call_provider(route, cred, payload, tr, max_tokens=max_out), None
         except ProviderError as pe:
             resp, err = None, pe
         self.s.lock()
@@ -685,89 +1174,319 @@ class Engine:
                 rec["provider"]["error"] = err.detail
                 if err.kind == "UNCERTAIN":
                     rec["reconcile"] = {"reason": "PROVIDER_UNCERTAIN " + err.detail, "at": self.clock()}
-                    transition(rec, "UNKNOWN_RECONCILE", "provider outcome uncertain; no blind retry")
+                    self._tr(rec, "UNKNOWN_RECONCILE", "provider outcome uncertain; no blind retry")
                 else:
                     rec["execution"]["maybe_write"] = False
-                    transition(rec, "STOP", "provider %s: %s" % (err.kind, err.detail))
+                    self._tr(rec, "STOP", "provider %s: %s" % (err.kind, err.detail))
                 self.s.put(rec, v)
                 return {"state": rec["state"], "provider": err.kind}
             rec["provider"].update(status="RESPONDED", response_id=resp["response_id"],
                                    request_id=resp["request_id"], model_reported=resp["model"],
                                    http_status=resp["http_status"], response_text_sha256=resp["text_sha256"])
+            self._charge(rec, "output_tokens", len(resp["text"]) // 4 + 1)
+            if self._exhausted(rec) == "output_tokens":
+                rec["provider"]["status"] = "OVER_BUDGET"
+                rec["execution"]["maybe_write"] = False
+                self._tr(rec, "STOP", "provider output over budget")
+                self.s.put(rec, v)
+                return {"state": "STOP", "provider": "OVER_BUDGET"}
             try:
                 o = parse_provider_json(resp["text"])
             except ProviderError as pe:
                 rec["provider"]["status"] = "MALFORMED"
                 rec["execution"]["maybe_write"] = False
-                transition(rec, "STOP", "provider result malformed: " + pe.detail)
+                self._tr(rec, "STOP", "provider result malformed: " + pe.detail)
                 self.s.put(rec, v)
                 return {"state": "STOP", "provider": "MALFORMED"}
             if (o.get("txn_id") != txn_id or o.get("proposal_sha256") != rec["proposal_sha256"]
                     or o.get("correlation_id") != corr):
                 rec["provider"]["status"] = "BINDING_MISMATCH"
                 rec["execution"]["maybe_write"] = False
-                transition(rec, "STOP", "provider result not bound to this transaction")
+                self._tr(rec, "STOP", "provider result not bound to this transaction")
                 self.s.put(rec, v)
                 return {"state": "STOP", "provider": "BINDING_MISMATCH"}
             res = {"echo": o["echo"], "txn_id": txn_id, "proposal_sha256": rec["proposal_sha256"]}
             rb = canon(res)
             if len(rb) > MAX_RESULT_BYTES:
-                transition(rec, "STOP", "provider result oversize")
+                self._tr(rec, "STOP", "provider result oversize")
                 self.s.put(rec, v)
                 return {"state": "STOP"}
             rec["result"] = {"result": res, "result_sha256": sha(rb), "persisted_at": self.clock(),
-                             "executor": rec["claim"]["executor"]}
+                             "executor": rec["claim"]["executor"], "package_digest": rec["package_digest"]}
             rec["execution"]["maybe_write"] = False
-            transition(rec, "RESULT_PERSISTED", "provider result persisted")
+            self._tr(rec, "RESULT_PERSISTED", "provider result persisted")
             self.s.put(rec, v)
-            return self._verify_and_close(txn_id)
+            return self._verify(txn_id)
         finally:
             self.s.unlock()
+            self._run_deferred()
 
     def owner_request(self, *, peer, remote_user_id, value, route, evidence):
-        """Minimal Dashboard request-entry control (owner only): creates a synthetic proposal.
-        Proposal creation is not authority; the owner still presses Authorize separately."""
+        """Dashboard request entry (owner only): creates a synthetic proposal, then the ChatGPT
+        designer problem-check runs. Proposal creation is not authority."""
         if peer != INGRESS_GATEWAY:
             raise Denied("NOT_INGRESS_GATEWAY", peer)
         if not remote_user_id or sha((OWNER_PIN_PREFIX + remote_user_id).encode()) != OWNER_PIN:
             raise Denied("NOT_OWNER", "request entry is owner-only")
         if not re.match(r"^[A-Za-z0-9 .,:_-]{1,80}$", value or ""):
             raise Denied("MALFORMED", "value")
-        txn = "TXN-05R-DB-" + time.strftime("%Y%m%d%H%M%S", time.gmtime(self.clock()))
+        if route not in EXECUTOR_ROUTES or route not in PROVIDERS:
+            raise Denied("PROVIDER_ROLE_VIOLATION", "%s is not an executor API route" % route)
+        txn = "TXN-08-DB-" + time.strftime("%Y%m%d%H%M%S", time.gmtime(self.clock()))
         p = {"op": "synthetic.echo", "target": "synthetic:echo", "value": {"msg": value},
              "scope": "synthetic-only; no Home Assistant state",
-             "effect": ("%s echoes the synthetic value via its API; GAOP verifies it%s"
+             "effect": ("%s echoes the synthetic value via its API; GAOP verifies it; openai-api reviews it%s"
                         % (route, "; archives one synthetic evidence file to the existing GAOP folder, "
                            "verifies it, deletes it" if evidence == "drive" else "")),
              "summary": "Dashboard synthetic request", "ttl_seconds": 1800, "route": route,
-             "evidence": "drive" if evidence == "drive" else "none"}
-        env = json.dumps({"protocol": PROTOCOL, "op": "propose", "txn_id": txn,
-                          "envelope_id": "dash-" + txn, "proposal": p})
+             "review_route": "openai-api", "evidence": "drive" if evidence == "drive" else "none"}
+        env = json.dumps({"protocol": PROTOCOL, "op": "propose", "txn_id": txn, "role": "designer",
+                          "envelope_id": "dash-" + txn, "proposal": p,
+                          "changed_condition": "owner-new-dashboard-request " + txn})
         out = self.apply_envelope(env)
         if out.get("outcome") == "ACCEPTED":
             self.s.lock()
             try:
                 rec = self.s.get(txn)
                 rec["origin"] = "dashboard-owner-request"
-                self.s._atomic(self.s._tp(txn), rec)
+                self.s.put(rec, rec["state_version"])
             finally:
                 self.s.unlock()
+            self._defer(self.design_check, txn)
+            self._run_deferred()
         return out
 
-    # ---------- verification / closeout ----------
-    def _verify_and_close(self, txn_id, drive=None):
+    # ---------- verification / review / closeout ----------
+    def _verify(self, txn_id):
+        """Deterministic execution verification against the package predicates (called with lock)."""
         rec = self.s.get(txn_id)
-        p, r = rec["proposal"], rec["result"]["result"]
-        ok = (p["op"] == "synthetic.echo" and isinstance(r, dict)
-              and r.get("echo") == p["value"] and r.get("txn_id") == txn_id
-              and r.get("proposal_sha256") == rec["proposal_sha256"])
+        pkg, r = rec["exec_package"], rec["result"]["result"]
+        preds = {"echo_equals_value": isinstance(r, dict) and r.get("echo") == pkg["parameters"],
+                 "bound_txn": isinstance(r, dict) and r.get("txn_id") == txn_id,
+                 "bound_proposal": isinstance(r, dict) and r.get("proposal_sha256") == rec["proposal_sha256"],
+                 "bound_package": rec["result"].get("package_digest") == rec["package_digest"]
+                 and package_digest(pkg) == rec["package_digest"]}
+        ok = pkg["operation"] == "synthetic.echo" and all(preds[k] for k in pkg["verification"])
         v = rec["state_version"]
+        rec["verification"] = {"predicates": {k: preds[k] for k in pkg["verification"]},
+                               "deterministic": "PASS" if ok else "FAIL", "at": self.clock(),
+                               "status": "VERIFICATION_EVIDENCE"}
         if not ok:
-            transition(rec, "STOP", "verification failed: result does not satisfy proposal")
+            self._tr(rec, "STOP", "verification failed: result does not satisfy package predicates")
+            rec["receipt"] = self.make_receipt(rec, "STOP")
             self.s.put(rec, v)
             return {"state": "STOP"}
-        transition(rec, "VERIFIED", "result verified against proposal")
+        self._tr(rec, "VERIFIED", "result verified against package predicates")
         rec = self.s.put(rec, v)
+        v = rec["state_version"]
+        self._tr(rec, "REVIEWING", "independent ChatGPT review requested")
+        self.s.put(rec, v)
+        self._defer(self.review_and_close, txn_id)
+        return {"state": "REVIEWING"}
+
+    def _reviewer_call(self, rec, kind, extra=None):
+        """Call the reviewer route with a compact machine payload. Returns (obj, meta) or raises
+        ProviderError. Charges provider/input/output budgets."""
+        route = rec["proposal"].get("review_route", "openai-api")
+        corr = "rvw-" + sha(canon({"txn_id": rec["txn_id"], "pkg": rec["package_digest"], "kind": kind,
+                                   "n": rec["budget"]["used"]["provider_calls"]}))[:20]
+        payload = {"kind": kind, "txn_id": rec["txn_id"], "package_digest": rec["package_digest"],
+                   "correlation_id": corr, "operation": rec["exec_package"]["operation"],
+                   "targets": rec["exec_package"]["targets"], "parameters": rec["exec_package"]["parameters"],
+                   "scope": rec["exec_package"]["scope"], "verification_predicates": rec["exec_package"]["verification"]}
+        if kind == "verify":
+            payload.update(result=rec["result"]["result"], result_sha256=rec["result"]["result_sha256"],
+                           deterministic_verification=rec["verification"],
+                           executor=rec["claim"]["executor"])
+        if extra:
+            payload.update(extra)
+        need = ("verdict", "issue_code", "evidence_status", "txn_id", "package_digest", "correlation_id")
+        meta = {"route": route, "correlation_id": corr, "kind": kind}
+        if route in self.adapters and callable(self.adapters[route]):
+            o = self.adapters[route](kind, payload)            # deterministic test reviewer
+            meta.update(model="test", response_id="rvw_test")
+            return o, meta
+        if route != "openai-api":
+            raise ProviderError("REJECTED", "no machine reviewer for %s" % route)
+        cred = load_provider_cred(self.s, route)
+        if cred is None:
+            raise ProviderError("NOT_CONFIGURED", route)
+        prompt = review_prompt(kind, payload)
+        lim, used = rec["budget"]["limits"], rec["budget"]["used"]
+        if used["input_tokens"] + len(prompt) // 4 > lim["input_tokens"]:
+            raise ProviderError("OVER_BUDGET", "input_tokens")
+        max_out = max(1, min(400, lim["output_tokens"] - used["output_tokens"]))
+        resp = provider_request(route, cred, REVIEW_SYSTEM, prompt, self.transport or http_transport,
+                                max_tokens=max_out)
+        meta.update(model=resp["model"], response_id=resp["response_id"], request_id=resp["request_id"],
+                    text_sha256=resp["text_sha256"], in_tok=len(prompt) // 4, out_tok=len(resp["text"]) // 4 + 1)
+        return extract_json(resp["text"], need), meta
+
+    def _bounded_review(self, txn_id, kind, extra=None):
+        """Run one reviewer call outside the lock with budget accounting; at most one counted retry of
+        a clearly failed non-consequential call; UNCERTAIN is never retried."""
+        attempts = 0
+        while True:
+            self.s.lock()
+            try:
+                rec = self.s.get(txn_id)
+                self._charge(rec, "provider_calls")
+                k = self._exhausted(rec)
+                v = rec["state_version"]
+                self.s.put(rec, v)
+            finally:
+                self.s.unlock()
+            if k:
+                return None, None, ProviderError("OVER_BUDGET", k)
+            try:
+                o, meta = self._reviewer_call(rec, kind, extra)
+                err = None
+            except ProviderError as pe:
+                o, meta, err = None, None, pe
+            self.s.lock()
+            try:
+                rec = self.s.get(txn_id)
+                v = rec["state_version"]
+                if meta:
+                    self._charge(rec, "input_tokens", meta.get("in_tok", 0))
+                    self._charge(rec, "output_tokens", meta.get("out_tok", 0))
+                retry_ok = (err is not None and err.kind in ("MALFORMED", "REJECTED")
+                            and rec["budget"]["used"]["retries"] < rec["budget"]["limits"]["retries"])
+                if retry_ok:
+                    self._charge(rec, "retries")
+                    rec.setdefault("retry_log", []).append([self.clock(), kind, err.kind, err.detail[:60]])
+                self.s.put(rec, v)
+            finally:
+                self.s.unlock()
+            attempts += 1
+            if not retry_ok or attempts > BUDGET_MAX["retries"]:
+                return o, meta, err
+
+    def _review_bound(self, rec, o, meta):
+        if o.get("txn_id") != rec["txn_id"] or o.get("package_digest") != rec["package_digest"] \
+                or (meta and o.get("correlation_id") != meta["correlation_id"]):
+            return "REVIEW_BINDING_MISMATCH"
+        if o.get("evidence_status") == "AUTHORITY":
+            return "PROVIDER_AUTHORITY_CLAIM"
+        return None
+
+    def review_and_close(self, txn_id):
+        """ChatGPT independent post-execution review. Never retries or re-executes the consequential
+        stage. Unavailable/uncertain review -> PARTIAL; disagreement gets one bounded round."""
+        rec = self.s.get(txn_id)
+        if rec is None or rec["state"] != "REVIEWING":
+            return {"state": (rec or {}).get("state"), "note": "not reviewing"}
+        if rec["proposal"].get("review_route") == "chatgpt-session":
+            return {"state": "REVIEWING", "note": "awaiting pull-route review envelope"}
+        o, meta, err = self._bounded_review(txn_id, "verify")
+        self.s.lock()
+        try:
+            rec = self.s.get(txn_id)
+            if rec["state"] != "REVIEWING":
+                return {"state": rec["state"], "note": "state changed during review; verdict ignored"}
+            if err is not None:
+                v = rec["state_version"]
+                rec["review"] = {"status": "UNAVAILABLE" if err.kind == "NOT_CONFIGURED" else err.kind,
+                                 "detail": err.detail[:80], "at": self.clock()}
+                self._tr(rec, "PARTIAL", "independent review %s; executed result retained, no retry/second mutation" % err.kind)
+                rec["receipt"] = self.make_receipt(rec, "PARTIAL")
+                self.s.put(rec, v)
+                self._register_op(rec)
+                return {"state": "PARTIAL", "review": rec["review"]["status"]}
+            return self._review_verdict(rec, o, meta=meta, source="adapter")
+        finally:
+            self.s.unlock()
+
+    def _review_verdict(self, rec, o, meta=None, source="adapter"):
+        v = rec["state_version"]
+        bad = self._review_bound(rec, o, meta) if source == "adapter" else (
+            "PROVIDER_AUTHORITY_CLAIM" if o.get("evidence_status") == "AUTHORITY" else None)
+        verdict = o.get("verdict")
+        rv = {"verdict": verdict, "issue_code": str(o.get("issue_code"))[:48], "claim": str(o.get("claim", ""))[:200],
+              "evidence_status": o.get("evidence_status"), "source": source, "at": self.clock()}
+        if meta:
+            rv.update({k: meta.get(k) for k in ("route", "model", "response_id", "request_id", "correlation_id")})
+        rec["review"] = rv
+        prior = rec.get("disagreement")
+        if bad:
+            rv["status"] = bad
+            self._tr(rec, "PARTIAL", "review rejected: " + bad)
+        elif verdict == "ACCEPT" and o.get("evidence_status") not in ACCEPTANCE_BASIS:
+            # anti-assumption: an acceptance resting on inference/unknown is not verification evidence
+            rv["status"] = "ANTI_ASSUMPTION_REJECTED"
+            self._tr(rec, "PARTIAL", "review acceptance not grounded in evidence")
+        elif verdict == "ACCEPT":
+            rv["status"] = "ACCEPTED"
+            if prior and prior["kind"] == "DISAGREE_VERIFICATION":
+                prior["outcome"] = "RESOLVED_NO_MATERIAL_CHANGE"
+            self.s.put(rec, v)
+            return self._closeout(rec["txn_id"])
+        elif verdict == "DISAGREE_VERIFICATION":
+            rv["status"] = "DISAGREED"
+            claim = self._claim_obj({"issue_code": o.get("issue_code"), "claim": o.get("claim"),
+                                     "evidence_status": o.get("evidence_status") if o.get("evidence_status") in FACT_STATUS else "UNKNOWN"},
+                                    "reviewer")
+            if prior is None and rec["budget"]["used"]["reconciliation_rounds"] < rec["budget"]["limits"]["reconciliation_rounds"]:
+                # one automatic structured round: re-present deterministic evidence + executor claim
+                rec["disagreement"] = {"kind": "DISAGREE_VERIFICATION", "issue_code": claim["issue_code"],
+                                       "claims": {"reviewer": claim, "executor": {
+                                           "role": "executor", "issue_code": "RESULT_VERIFIED",
+                                           "claim": "deterministic predicates PASS", "evidence_status": "VERIFICATION_EVIDENCE",
+                                           "evidence": rec["result"]["result_sha256"]}},
+                                       "agreed_facts": ["txn_id", "package_digest", "result_sha256"],
+                                       "unknown_facts": [claim["issue_code"]], "authority_valid": "CONSUMED",
+                                       "rounds_used": 1, "outcome": None, "opened_at": self.clock()}
+                self._charge(rec, "reconciliation_rounds")
+                self.s.put(rec, v)
+                if source == "adapter":
+                    self._defer(self._reconsider_review, rec["txn_id"])
+                    return {"state": "REVIEWING", "disagreement": "ROUND_1"}
+                return {"state": "REVIEWING", "disagreement": "ROUND_1_AWAITING_REVIEW"}
+            # unresolved after the bounded round: no retry, rollback or second mutation
+            if prior is None:
+                rec["disagreement"] = {"kind": "DISAGREE_VERIFICATION", "issue_code": claim["issue_code"],
+                                       "claims": {"reviewer": claim}, "rounds_used": 0, "authority_valid": "CONSUMED",
+                                       "agreed_facts": ["txn_id", "package_digest"], "unknown_facts": [claim["issue_code"]]}
+            rec["disagreement"]["outcome"] = "UNRESOLVED_USER_DECISION"
+            self._tr(rec, "PARTIAL", "post-execution disagreement unresolved; owner decision; no blind retry")
+        else:
+            rv["status"] = "MALFORMED_VERDICT"
+            self._tr(rec, "PARTIAL", "review verdict malformed")
+        rec["receipt"] = self.make_receipt(rec, "PARTIAL")
+        self.s.put(rec, v)
+        self._register_op(rec)
+        return {"state": "PARTIAL", "review": rv.get("status"),
+                "disagreement_outcome": (rec.get("disagreement") or {}).get("outcome")}
+
+    def _reconsider_review(self, txn_id):
+        rec = self.s.get(txn_id)
+        if rec is None or rec["state"] != "REVIEWING":
+            return {"state": (rec or {}).get("state")}
+        d = rec["disagreement"]
+        o, meta, err = self._bounded_review(txn_id, "verify", extra={
+            "reconsider": {"your_prior_issue": d["issue_code"], "executor_claim": d["claims"]["executor"],
+                           "note": "single bounded reconsideration round; deterministic evidence attached"}})
+        self.s.lock()
+        try:
+            rec = self.s.get(txn_id)
+            if rec["state"] != "REVIEWING":
+                return {"state": rec["state"]}
+            if err is not None:
+                v = rec["state_version"]
+                rec["disagreement"]["outcome"] = "UNRESOLVED_USER_DECISION"
+                rec["review"]["status"] = "RECONSIDER_" + err.kind
+                self._tr(rec, "PARTIAL", "reconsideration unavailable; owner decision")
+                rec["receipt"] = self.make_receipt(rec, "PARTIAL")
+                self.s.put(rec, v)
+                self._register_op(rec)
+                return {"state": "PARTIAL"}
+            return self._review_verdict(rec, o, meta=meta, source="adapter")
+        finally:
+            self.s.unlock()
+
+    def _closeout(self, txn_id):
+        rec = self.s.get(txn_id)
+        p = rec["proposal"]
         evidence = {"mode": p.get("evidence", "none"), "status": "NOT_REQUIRED"}
         if p.get("evidence") == "drive":
             evidence = self.drive_evidence(rec) if self.adapters.get("drive_evidence") is None \
@@ -776,13 +1495,58 @@ class Engine:
         v = rec["state_version"]
         rec["evidence"] = evidence
         if evidence.get("status") not in ("NOT_REQUIRED", "ARCHIVED_VERIFIED"):
-            transition(rec, "STOP", "evidence step failed: " + str(evidence.get("status")))
+            self._tr(rec, "STOP", "evidence step failed: " + str(evidence.get("status")))
+            rec["receipt"] = self.make_receipt(rec, "STOP")
             self.s.put(rec, v)
             return {"state": "STOP", "evidence": evidence.get("status")}
+        self._tr(rec, "COMPLETED", "closed out after independent review")
         rec["receipt"] = self.make_receipt(rec, "COMPLETED")
-        transition(rec, "COMPLETED", "closed out")
         self.s.put(rec, v)
+        self._register_op(rec)
+        self._record_stats(rec)
         return {"state": "COMPLETED", "receipt_sha256": rec["receipt"]["receipt_sha256"]}
+
+    def _register_op(self, rec):
+        if rec.get("operation_id") and rec.get("result") is not None:
+            self.s.op_put(rec["operation_id"], {"txn_id": rec["txn_id"], "state": rec["state"],
+                                                "receipt_sha256": (rec.get("receipt") or {}).get("receipt_sha256"),
+                                                "package_digest": rec.get("package_digest")})
+
+    # ---------- design / problem-check (pre-authorization; ChatGPT designer) ----------
+    def design_check(self, txn_id):
+        rec = self.s.get(txn_id)
+        if rec is None or rec["state"] != "AWAITING_AUTHORITY" or rec.get("design_review"):
+            return {"state": (rec or {}).get("state")}
+        o, meta, err = self._bounded_review(txn_id, "design")
+        self.s.lock()
+        try:
+            rec = self.s.get(txn_id)
+            if rec["state"] != "AWAITING_AUTHORITY":
+                return {"state": rec["state"]}
+            v = rec["state_version"]
+            if err is not None:
+                rec["design_review"] = {"status": "UNAVAILABLE" if err.kind == "NOT_CONFIGURED" else err.kind,
+                                        "at": self.clock()}
+                self.s.put(rec, v)
+                return {"state": rec["state"], "design": rec["design_review"]["status"]}
+            bad = self._review_bound(rec, o, meta)
+            dr = {"verdict": o.get("verdict"), "issue_code": str(o.get("issue_code"))[:48],
+                  "claim": str(o.get("claim", ""))[:200], "evidence_status": o.get("evidence_status"),
+                  "status": bad or "RECEIVED", "at": self.clock(),
+                  **{k: meta.get(k) for k in ("route", "model", "response_id", "request_id", "correlation_id")}}
+            rec["design_review"] = dr
+            if not bad and o.get("verdict") == "DISAGREE_DESIGN":
+                claim = self._claim_obj({"issue_code": o.get("issue_code"), "claim": o.get("claim"),
+                                         "evidence_status": o.get("evidence_status") if o.get("evidence_status") in FACT_STATUS else "UNKNOWN"},
+                                        "designer")
+                self._open_disagreement(rec, "DISAGREE_DESIGN", claim, None, "ChatGPT design objection; authorize unavailable")
+                if rec.get("prior_disagreements"):
+                    rec["disagreement"]["rounds_used"] = len(rec["prior_disagreements"])
+                    rec["disagreement"]["outcome"] = "UNRESOLVED_USER_DECISION"
+            self.s.put(rec, v)
+            return {"state": rec["state"], "design": dr["verdict"]}
+        finally:
+            self.s.unlock()
 
     def drive_evidence(self, rec):
         return {"mode": "drive", "status": "STOP_NO_DRIVE_CREDENTIAL"}
@@ -790,14 +1554,18 @@ class Engine:
     @staticmethod
     def make_receipt(rec, final):
         ev, pv = rec.get("evidence") or {}, rec.get("provider") or {}
-        body = {"schema": "gaop.receipt.v2", "txn_id": rec["txn_id"],
+        rv, dg = rec.get("review") or {}, rec.get("disagreement") or {}
+        body = {"schema": "gaop.receipt.v3", "txn_id": rec["txn_id"],
                 "proposal_sha256": rec["proposal_sha256"], "revision": rec["revision"],
+                "package_digest": rec.get("package_digest"), "operation_id": rec.get("operation_id"),
                 "authority_sha256": (rec.get("authority") or {}).get("authority_sha256"),
+                "authority_package_digest": (rec.get("authority") or {}).get("package_digest"),
                 "dispatch_id": (rec.get("dispatch") or {}).get("dispatch_id"),
                 "package_sha256": (rec.get("dispatch") or {}).get("package_sha256"),
                 "claim_id": (rec.get("claim") or {}).get("claim_id"),
                 "executor": (rec.get("claim") or {}).get("executor"),
                 "result_sha256": (rec.get("result") or {}).get("result_sha256"),
+                "deterministic_verification": (rec.get("verification") or {}).get("deterministic"),
                 "evidence_status": (rec.get("evidence") or {}).get("status"),
                 "evidence_file_sha256": ev.get("sha256"),
                 "evidence_integrity": ev.get("integrity"),
@@ -809,6 +1577,13 @@ class Engine:
                 "provider_route": pv.get("route"), "provider_model": pv.get("model_reported") or pv.get("model"),
                 "provider_response_id": pv.get("response_id"), "provider_request_id": pv.get("request_id"),
                 "provider_correlation_id": pv.get("correlation_id"),
+                "review_route": rv.get("route"), "review_model": rv.get("model"), "review_verdict": rv.get("verdict"),
+                "review_status": rv.get("status"), "review_response_id": rv.get("response_id"),
+                "review_request_id": rv.get("request_id"), "review_correlation_id": rv.get("correlation_id"),
+                "design_verdict": (rec.get("design_review") or {}).get("verdict"),
+                "disagreement_kind": dg.get("kind"), "disagreement_outcome": dg.get("outcome"),
+                "budget_used": (rec.get("budget") or {}).get("used"),
+                "last_checkpoint_state_version": (rec.get("last_checkpoint") or {}).get("state_version"),
                 "reconcile_resolution": (rec.get("reconcile") or {}).get("resolution"),
                 "final_state": final, "gaop_version": VERSION}
         body["receipt_sha256"] = sha(canon(body))
@@ -823,7 +1598,7 @@ class Engine:
             raise Denied("NOT_OWNER", "identity pin mismatch")
         self.s.lock()
         try:
-            rec = self._load(txn_id, {"AWAITING_AUTHORITY"})
+            rec = self._load(txn_id, {"AWAITING_AUTHORITY", "DISAGREEMENT"})
             if str(state_version) != str(rec["state_version"]):
                 raise Denied("STALE_VIEW", "state_version")
             if proposal_sha256 != rec["proposal_sha256"]:
@@ -832,51 +1607,106 @@ class Engine:
                 raise Denied("REPLAY", "nonce already used")
             if not rec["pending_nonce"] or nonce != rec["pending_nonce"]:
                 raise Denied("NONCE_MISMATCH", "nonce")
+            if rec["state"] == "DISAGREEMENT":
+                return self._owner_disagreement(rec, nonce, decision)
+            if not rec.get("exec_package"):
+                raise Denied("LEGACY_RECORD_NO_PACKAGE", "re-propose under v0.8")
             v = rec["state_version"]
             rec["used_nonces"].append(nonce)
             rec["pending_nonce"] = None
             if decision == "reject":
-                transition(rec, "REJECTED", "owner rejected on dashboard")
+                self._tr(rec, "REJECTED", "owner rejected on dashboard")
                 self.s.put(rec, v)
                 return {"state": "REJECTED"}
             if decision == "revise":
-                transition(rec, "PROPOSED", "owner requested revision on dashboard")
+                self._tr(rec, "PROPOSED", "owner requested revision on dashboard")
                 rec["reconcile"] = {"reason": "REVISION_REQUESTED", "at": self.clock()}
                 self.s.put(rec, v)
                 return {"state": "PROPOSED"}
             if decision != "authorize":
                 raise Denied("MALFORMED", "decision")
+            if package_digest(rec["exec_package"]) != rec["package_digest"]:
+                raise Denied("PACKAGE_DIGEST_MISMATCH", "pre-authority")
             a = {"txn_id": txn_id, "proposal_sha256": rec["proposal_sha256"],
                  "revision": rec["revision"], "scope": rec["proposal"]["scope"],
                  "target": rec["proposal"]["target"], "expires_at": rec["expires_at"],
+                 "package_digest": rec["package_digest"], "operation_id": rec["operation_id"],
+                 "roles": {"executor": rec["proposal"]["route"],
+                           "reviewer": rec["proposal"].get("review_route", "openai-api")},
+                 "verification": rec["exec_package"]["verification"], "one_time": True,
                  "nonce_sha256": sha(nonce.encode()), "authorized_at": self.clock(),
                  "origin": "dashboard-ingress-owner"}
             a["authority_sha256"] = sha(canon(a))
             rec["authority"] = a
-            transition(rec, "AUTHORIZED", "owner authorized on dashboard")
+            rec["budget"]["started"] = self.clock()        # execution budget clock starts at authority
+            self._tr(rec, "AUTHORIZED", "owner authorized on dashboard")
             rec = self.s.put(rec, v)
             return self._dispatch(rec)
         finally:
             self.s.unlock()
+            self._run_deferred()
+
+    def _owner_disagreement(self, rec, nonce, decision):
+        d = rec["disagreement"]
+        v = rec["state_version"]
+        if decision == "reject":
+            rec["used_nonces"].append(nonce)
+            rec["pending_nonce"] = None
+            rec["authority"] = None
+            d["outcome"] = "OWNER_REJECTED"
+            self._tr(rec, "CANCELLED", "owner rejected after disagreement")
+            self.s.put(rec, v)
+            return {"state": "CANCELLED"}
+        if decision in ("approve_revised", "accept_alternative"):
+            alt = d.get("alternative") if decision == "accept_alternative" else d.get("revised")
+            if not alt:
+                raise Denied("UNDEFINED_ACTION", decision)
+            rec["used_nonces"].append(nonce)
+            d["outcome"] = "OWNER_SELECTED_" + decision.upper()
+            self._apply_revision(rec, validate_proposal(alt), "owner selected %s; fresh Authorize required" % decision)
+            self.s.put(rec, v)
+            return {"state": "AWAITING_AUTHORITY"}
+        if decision == "reconsider":
+            if d["rounds_used"] >= rec["budget"]["limits"]["reconciliation_rounds"]:
+                raise Denied("RECONCILIATION_BUDGET_EXHAUSTED", "no further rounds")
+            rec["used_nonces"].append(nonce)
+            d["reconsider_requested"] = self.clock()
+            if d["kind"] == "DISAGREE_DESIGN" and rec["proposal"].get("review_route") == "openai-api":
+                # ask the designer to reconsider once (counted round); proposal itself unchanged
+                d["rounds_used"] += 1
+                self._charge(rec, "reconciliation_rounds")
+                rec["pending_nonce"] = secrets.token_hex(16)
+                rec["design_review"] = None
+                rec.setdefault("prior_disagreements", []).append(d)
+                rec["disagreement"] = None
+                self._tr(rec, "AWAITING_AUTHORITY", "owner asked designer to reconsider once")
+                self.s.put(rec, v)
+                self._defer(self.design_check, rec["txn_id"])
+                return {"state": "AWAITING_AUTHORITY", "reconsider": "DESIGN_RECHECK"}
+            rec["pending_nonce"] = secrets.token_hex(16)
+            self.s.put(rec, v)
+            return {"state": "DISAGREEMENT", "reconsider": "REQUESTED"}
+        raise Denied("MALFORMED", "decision")
 
     def _dispatch(self, rec):
         if rec["state"] != "AUTHORIZED":
             raise Denied("DUPLICATE_DISPATCH", rec["state"])
         v = rec["state_version"]
-        transition(rec, "DISPATCH_PENDING", "dispatch pending")
+        self._tr(rec, "DISPATCH_PENDING", "dispatch pending")
         rec = self.s.put(rec, v)
-        pkg = {"schema": "gaop.package.v1", "txn_id": rec["txn_id"], "revision": rec["revision"],
+        pkg = {"schema": "gaop.package.v2", "txn_id": rec["txn_id"], "revision": rec["revision"],
                "proposal": rec["proposal"], "proposal_sha256": rec["proposal_sha256"],
                "authority_sha256": rec["authority"]["authority_sha256"],
+               "exec_package": rec["exec_package"], "package_digest": rec["package_digest"],
                "action_id": "act-" + rec["proposal_sha256"][:16], "expires_at": rec["expires_at"]}
         pb = canon(pkg)
         if len(pb) > MAX_PACKAGE_BYTES:
             v = rec["state_version"]
-            transition(rec, "STOP", "package exceeds bound")
+            self._tr(rec, "STOP", "package exceeds bound")
             self.s.put(rec, v)
             return {"state": "STOP"}
         route = rec["proposal"]["route"]
-        ad = self.adapters.get(route) or adapter_for(route, self.s)
+        ad = self.adapters.get(route) if isinstance(self.adapters.get(route), Adapter) else adapter_for(route, self.s)
         idem = sha(canon({"txn_id": rec["txn_id"], "proposal_sha256": rec["proposal_sha256"],
                           "authority_sha256": rec["authority"]["authority_sha256"]}))
         ack = ad.dispatch(txn_id=rec["txn_id"], locator="api/pkg/" + rec["txn_id"],
@@ -888,43 +1718,147 @@ class Engine:
                            "action_id": pkg["action_id"], "ack": dict(ack),
                            "dispatched_at": self.clock()}
         if ack.get("status") != "DISPATCHED":
-            transition(rec, "STOP", "adapter: " + str(ack.get("error")))
+            self._tr(rec, "STOP", "adapter: " + str(ack.get("error")))
             self.s.put(rec, v)
             return {"state": "STOP", "adapter_error": ack.get("error")}
-        transition(rec, "DISPATCHED", "dispatched via " + route)
+        self._tr(rec, "DISPATCHED", "dispatched via " + route)
         self.s.put(rec, v)
-        return {"state": "DISPATCHED", "package_sha256": sha(pb)}
+        return {"state": "DISPATCHED", "package_sha256": sha(pb), "package_digest": rec["package_digest"]}
 
-    # ---------- boot reconciliation (restart never replays) ----------
+    # ---------- boot reconciliation / resume (restart never replays consequential work) ----------
     def boot_reconcile(self):
         out = []
         for t in self.s.active():
             rec = self.s.get(t)
             if rec is None:
                 continue
-            if rec["state"] in ("RUNNING", "DISPATCH_PENDING", "RESULT_PERSISTED", "VERIFIED"):
-                v = rec["state_version"]
-                rec["reconcile"] = {"reason": "INTERRUPTED_" + rec["state"], "at": self.clock()}
-                transition(rec, "UNKNOWN_RECONCILE", "restart found interrupted maybe-write; no replay")
+            st = rec["state"]
+            cp = rec.get("last_checkpoint") or {}
+            v = rec["state_version"]
+            if st == "RESULT_PERSISTED" and cp.get("verified") and cp.get("stage") == st \
+                    and rec.get("resume_count", 0) == 0 and rec.get("exec_package"):
+                # deterministic, non-consequential stage: resume from the verified checkpoint once
+                rec["resume_count"] = 1
+                self.s.put(rec, v)
+                self.s.lock()
+                try:
+                    r = self._verify(t)
+                finally:
+                    self.s.unlock()
+                out.append((t, "RESUMED_" + r["state"]))
+                continue
+            if st == "REVIEWING":
+                rec["review"] = dict(rec.get("review") or {}, status="INTERRUPTED")
+                self._tr(rec, "PARTIAL", "review interrupted by restart; no blind retry")
+                rec["receipt"] = self.make_receipt(rec, "PARTIAL")
+                self.s.put(rec, v)
+                self._register_op(rec)
+                out.append((t, "PARTIAL"))
+                continue
+            if st in ("RUNNING", "DISPATCH_PENDING", "RESULT_PERSISTED", "VERIFIED"):
+                rec["reconcile"] = {"reason": "INTERRUPTED_" + st, "at": self.clock(),
+                                    "last_checkpoint": cp}
+                self._tr(rec, "UNKNOWN_RECONCILE", "restart found interrupted maybe-write; no replay")
                 self.s.put(rec, v)
                 out.append((t, "UNKNOWN_RECONCILE"))
+        self._run_deferred()
         return out
 
     def pending_api_dispatches(self):
         return [t for t in self.s.active()
                 if (self.s.get(t) or {}).get("state") == "DISPATCHED"
-                and self.s.get(t)["proposal"]["route"] in PROVIDERS]
+                and self.s.get(t)["proposal"]["route"] in PROVIDERS
+                and not self.s.get(t).get("authority_use")]
+
+    # ---------- liveness: heartbeat, stall detection, ETA ----------
+    def _eta(self, rec):
+        st = self.s.stats_get().get(rec["proposal"]["route"], {})
+        if rec["state"] not in FLOW:
+            return None
+        rem = FLOW[FLOW.index(rec["state"]):-1]
+        tot = 0
+        for s in rem:
+            xs = sorted(st.get(s, []))
+            if len(xs) < 3:
+                return None                     # no invented ETA without observed stage data
+            tot += xs[len(xs) // 2]
+        return max(0, tot - (self.clock() - rec.get("stage_entered", self.clock())))
+
+    def _record_stats(self, rec):
+        h = rec.get("history", [])
+        st = self.s.stats_get()
+        r = st.setdefault(rec["proposal"]["route"], {})
+        for i in range(len(h) - 1):
+            r.setdefault(h[i][2], []).append(h[i + 1][0] - h[i][0])
+            r[h[i][2]] = r[h[i][2]][-10:]
+        self.s.stats_put(st)
+
+    def watchdog_tick(self):
+        """Bounded stall detection: a stage past its timeout settles visibly; no invisible loops."""
+        out = []
+        self.s.lock()
+        try:
+            for t in self.s.active():
+                rec = self.s.get(t)
+                if rec is None or rec["state"] in TERMINAL:
+                    continue
+                st, age = rec["state"], self.clock() - rec.get("stage_entered", rec.get("updated", self.clock()))
+                lim = STAGE_TIMEOUTS.get(st)
+                k = self._exhausted(rec) if rec["state"] not in ("AWAITING_AUTHORITY", "DISPATCHED", "DISAGREEMENT", "UNKNOWN_RECONCILE") else None
+                if (lim is None or age <= lim) and not k:
+                    continue
+                v = rec["state_version"]
+                why = "STALL_%s_%ds" % (st, age) if not k else "BUDGET_" + k
+                if k and st in ("AUTHORIZED", "CLAIMED") and not rec.get("result"):
+                    rec["authority"] = None
+                    rec["budget"]["exhausted"] = k
+                    self._tr(rec, "STOP", why + "; nothing executed")
+                    self.s.put(rec, v)
+                    out.append((t, "STOP"))
+                elif st == "REVIEWING" or (rec.get("result") and st != "RUNNING"):
+                    rec["review"] = dict(rec.get("review") or {}, status="STALLED")
+                    self._tr(rec, "PARTIAL", why + "; executed result retained; no retry")
+                    rec["receipt"] = self.make_receipt(rec, "PARTIAL")
+                    self.s.put(rec, v)
+                    self._register_op(rec)
+                    out.append((t, "PARTIAL"))
+                else:
+                    rec["reconcile"] = {"reason": why, "at": self.clock(), "last_checkpoint": rec.get("last_checkpoint")}
+                    self._tr(rec, "UNKNOWN_RECONCILE", why + "; no blind retry")
+                    self.s.put(rec, v)
+                    out.append((t, "UNKNOWN_RECONCILE"))
+        finally:
+            self.s.unlock()
+        return out
+
+    def heartbeat(self):
+        live = {"schema": "gaop.live.v1", "heartbeat_at": self.clock(), "period_s": HEARTBEAT_SECONDS, "txns": {}}
+        for t in self.s.active():
+            rec = self.s.get(t)
+            if rec is None:
+                continue
+            live["txns"][t] = self.live_view(rec)
+        self.s.live_put(live)
+        return live
+
+    def live_view(self, rec):
+        c = self.clock()
+        b = rec.get("budget") or {}
+        return {"state": rec["state"], "stage_elapsed_s": c - rec.get("stage_entered", rec.get("updated", c)),
+                "txn_elapsed_s": c - rec.get("created", c), "last_checkpoint": rec.get("last_checkpoint"),
+                "stage_timeout_s": STAGE_TIMEOUTS.get(rec["state"]), "eta_s": self._eta(rec),
+                "budget_used": b.get("used"), "budget_limits": b.get("limits")}
 
     # ---------- exact, bounded retrieval (no list-all) ----------
     def view(self, txn_id, owner=False):
         rec = self.s.get(txn_id)
         if rec is None:
             raise Denied("UNKNOWN_TXN", txn_id)
-        v = {k: rec[k] for k in ("txn_id", "state", "state_version", "revision", "proposal",
-                                 "proposal_sha256", "expires_at", "reconcile")}
+        v = {k: rec.get(k) for k in ("txn_id", "state", "state_version", "revision", "proposal",
+                                     "proposal_sha256", "expires_at", "reconcile", "package_digest",
+                                     "operation_id", "design_review", "review", "last_checkpoint")}
         v["authority_sha256"] = (rec.get("authority") or {}).get("authority_sha256")
         c = rec.get("claim") or {}
-        # v0.7.2: claim_id acts as a bearer token for begin/result, so only its hash is exposed.
         v["claim"] = {"claim_id_sha256": sha(c["claim_id"].encode()) if c.get("claim_id") else None,
                       "executor": c.get("executor"), "lease_until": c.get("lease_until")}
         pv = rec.get("provider") or {}
@@ -935,19 +1869,31 @@ class Engine:
         v["result_sha256"] = (rec.get("result") or {}).get("result_sha256")
         v["evidence_status"] = (rec.get("evidence") or {}).get("status")
         v["receipt_sha256"] = (rec.get("receipt") or {}).get("receipt_sha256")
-        if owner and rec["state"] == "AWAITING_AUTHORITY":
+        v["disagreement"] = rec.get("disagreement")
+        v["live"] = self.live_view(rec) if "budget" in rec else None
+        if owner and rec["state"] in ("AWAITING_AUTHORITY", "DISAGREEMENT"):
             v["pending_nonce"] = rec["pending_nonce"]
         return v
 
     def package(self, txn_id):
-        rec = self.s.get(txn_id)
-        if rec is None or not rec.get("dispatch") or rec["state"] not in ("DISPATCHED", "CLAIMED", "RUNNING"):
-            raise Denied("NO_PACKAGE", txn_id)
-        pb = canon(rec["dispatch"]["package"])
-        if len(pb) > MAX_PACKAGE_BYTES or sha(pb) != rec["dispatch"]["package_sha256"]:
-            raise Denied("PACKAGE_INTEGRITY", txn_id)
-        return {"package": rec["dispatch"]["package"], "package_sha256": sha(pb),
-                "bytes": len(pb)}
+        self.s.lock()
+        try:
+            rec = self.s.get(txn_id)
+            if rec is None or not rec.get("dispatch") or rec["state"] not in ("DISPATCHED", "CLAIMED", "RUNNING"):
+                raise Denied("NO_PACKAGE", txn_id)
+            pb = canon(rec["dispatch"]["package"])
+            if len(pb) > MAX_PACKAGE_BYTES or sha(pb) != rec["dispatch"]["package_sha256"]:
+                raise Denied("PACKAGE_INTEGRITY", txn_id)
+            if rec.get("budget"):
+                self._charge(rec, "retrieval_bytes", len(pb))
+                if self._exhausted(rec) == "retrieval_bytes":
+                    self.s.put(rec, rec["state_version"])
+                    self._enforce_budget(rec)
+                self.s.put(rec, rec["state_version"])
+        finally:
+            self.s.unlock()
+            self._run_deferred()
+        return {"package": rec["dispatch"]["package"], "package_sha256": sha(pb), "bytes": len(pb)}
 
 
 # ============================== attestation ==============================
@@ -1236,11 +2182,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 return self._send(200, self._panel(owner), "text/html")
-            m = re.match(r"^/api/(txn|pkg|receipt)/(TXN-[A-Z0-9-]+)$", path)
+            m = re.match(r"^/api/(txn|pkg|receipt|live)/(TXN-[A-Z0-9-]+)$", path)
             if m:
                 kind, t = m.groups()
                 if kind == "txn":
                     return self._json(200, self.engine.view(t))
+                if kind == "live":
+                    rec = self.engine.s.get(t)
+                    if not rec:
+                        raise Denied("UNKNOWN_TXN", t)
+                    hb = self.engine.s.live_get()
+                    return self._json(200, {"txn_id": t, "heartbeat_at": hb.get("heartbeat_at"),
+                                            "period_s": HEARTBEAT_SECONDS, "live": self.engine.live_view(rec)})
                 if kind == "pkg":
                     return self._json(200, self.engine.package(t))
                 rec = self.engine.s.get(t)
@@ -1357,6 +2310,41 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             p = v["proposal"]
             form = ""
+            dr = v.get("design_review") or {}
+            extra = ""
+            if dr:
+                extra += ('<p class="st">ChatGPT design check: <b>%s</b> %s %s</p>'
+                          % (esc(dr.get("verdict") or dr.get("status")), esc(dr.get("issue_code") or ""), esc(dr.get("claim") or "")))
+            lv = v.get("live") or {}
+            if v["state"] not in ("AWAITING_AUTHORITY", "DISAGREEMENT", "PROPOSED"):
+                extra += ('<p class="st">Stage <b>%s</b> · stage %ss · total %ss · %s · last checkpoint v%s</p>'
+                          % (esc(v["state"]), esc(lv.get("stage_elapsed_s")), esc(lv.get("txn_elapsed_s")),
+                             ("ETA ~%ss" % esc(lv["eta_s"])) if lv.get("eta_s") is not None else "no ETA yet (stage/elapsed shown)",
+                             esc((v.get("last_checkpoint") or {}).get("state_version"))))
+            dg = v.get("disagreement") or {}
+            if v["state"] == "DISAGREEMENT" and dg:
+                cl = dg.get("claims", {})
+                extra += ('<div class="n"><b>Issue:</b> %s (%s)<br><b>ChatGPT view:</b> %s<br><b>Claude view:</b> %s<br>'
+                          '<b>Agreed:</b> %s<br><b>Why it matters:</b> execution is paused; authority %s<br>'
+                          '<b>Recommended safe next step:</b> %s</div>'
+                          % (esc(dg.get("issue_code")), esc(dg.get("kind")),
+                             esc((cl.get("designer") or cl.get("reviewer") or {}).get("claim", "—")),
+                             esc((cl.get("executor") or {}).get("claim", "—")), esc(", ".join(dg.get("agreed_facts", []))),
+                             esc(dg.get("authority_valid")),
+                             "Reject / Cancel unless the objection is resolved" if dg.get("outcome") else "Ask both to reconsider once"))
+            if owner and v["state"] == "DISAGREEMENT":
+                hid = "".join('<input type="hidden" name="%s" value="%s">' % (k, esc(x)) for k, x in (
+                    ("txn_id", v["txn_id"]), ("proposal_sha256", v["proposal_sha256"]),
+                    ("state_version", v["state_version"]), ("nonce", v["pending_nonce"])))
+                btn = ""
+                if dg.get("revised"):
+                    btn += '<button name="decision" value="approve_revised">Approve revised ChatGPT design</button> '
+                if dg.get("alternative"):
+                    btn += '<button name="decision" value="accept_alternative">Accept Claude alternative</button> '
+                if dg.get("rounds_used", 0) < 1 and not dg.get("outcome"):
+                    btn += '<button name="decision" value="reconsider">Ask both to reconsider once</button> '
+                btn += '<button name="decision" value="reject">Reject / Cancel</button>'
+                form = '<form method="post" action="%s/authority">%s%s</form>' % (base, hid, btn)
             if owner and v["state"] == "AWAITING_AUTHORITY":
                 hid = "".join('<input type="hidden" name="%s" value="%s">' % (k, esc(x)) for k, x in (
                     ("txn_id", v["txn_id"]), ("proposal_sha256", v["proposal_sha256"]),
@@ -1376,7 +2364,7 @@ class Handler(BaseHTTPRequestHandler):
                    esc(json.dumps(p["value"])), esc(p["scope"]), esc(p["effect"]), esc(p["route"]),
                    esc(p.get("evidence", "none")),
                    esc(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(v["expires_at"]))),
-                   esc(v["revision"]), esc(v["proposal_sha256"]), form))
+                   esc(v["revision"]), esc(v["proposal_sha256"]), extra + form))
         recent = []
         for t in reversed(e.s.recent()):
             try:
@@ -1396,14 +2384,15 @@ class Handler(BaseHTTPRequestHandler):
         if owner:
             ps = provider_status(e.s)
             opts_r = "".join('<option value="%s">%s (%s)</option>' % (r, r, esc(ps[r]["model"]))
-                             for r in PROVIDERS if ps[r]["configured"])
+                             for r in PROVIDERS if ps[r]["configured"] and r in EXECUTOR_ROUTES)
             if opts_r:
                 req = ('<div class="card"><h3>New synthetic request</h3><form method="post" action="%s/request">'
                        '<input name="value" placeholder="synthetic value to echo" size="40" maxlength="80"> '
                        '<select name="route">%s</select> '
                        '<label><input type="checkbox" name="evidence" value="drive" checked> Drive evidence</label> '
-                       '<button>Create proposal</button></form><p class="st">Creates a proposal only. '
-                       'It runs after you press Authorize on its card.</p></div>' % (base, opts_r))
+                       '<button>Create proposal</button></form><p class="st">Creates a proposal and asks ChatGPT (openai-api: %s) '
+                       'to problem-check it. Claude executes only after you press Authorize; ChatGPT then reviews the result.</p></div>'
+                       % (base, opts_r, "configured" if ps["openai-api"]["configured"] else "NOT configured — results will be PARTIAL"))
         setup = ""
         if owner:
             ps = provider_status(e.s)
@@ -1444,8 +2433,12 @@ class Handler(BaseHTTPRequestHandler):
             setup += "</div>"
         a = self.att or {}
         setup = req + rec_html + setup
+        busy = any((e.s.get(t) or {}).get("state") not in (None, "AWAITING_AUTHORITY", "DISAGREEMENT", "DISPATCHED", "UNKNOWN_RECONCILE")
+                   for t in e.s.active())
+        hb = e.s.live_get().get("heartbeat_at")
+        refresh = "<meta http-equiv='refresh' content='%d'>" % HEARTBEAT_SECONDS if busy else ""
         return ("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' "
-                "content='width=device-width,initial-scale=1'><title>GAOP</title><style>"
+                "content='width=device-width,initial-scale=1'>" + refresh + "<title>GAOP</title><style>"
                 "body{font-family:system-ui,sans-serif;margin:16px;background:#fafafa;color:#222}"
                 ".card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:12px;margin:12px 0}"
                 "td{padding:3px 8px;vertical-align:top}.h{font-family:monospace;word-break:break-all;font-size:12px}"
@@ -1454,9 +2447,10 @@ class Handler(BaseHTTPRequestHandler):
                 ".n{background:#fff4d6;padding:8px;border-radius:6px}"
                 "@media(prefers-color-scheme:dark){body{background:#111;color:#eee}.card{background:#1c1c1c;border-color:#333}}"
                 "</style></head><body><h2>GAOP — Governed AI Operations Platform</h2>"
-                "<p>v%s · attestation %s · source %s · %s</p>%s%s%s</body></html>"
+                "<p>v%s · attestation %s · source %s · %s · heartbeat %s</p>%s%s%s</body></html>"
                 % (esc(VERSION), esc(a.get("attestation")), esc((a.get("private_source_commit") or "")[:12]),
                    "owner view" if owner else "read-only view (not owner)",
+                   ("%ss ago" % (now() - hb)) if hb else "n/a",
                    ('<p class="n">%s</p>' % esc(notice)) if notice else "",
                    "".join(rows) or "<p>No active transactions.</p>", setup))
 
@@ -1482,7 +2476,7 @@ def serve():
             time.sleep(3600)
     opts = read_options()
     cred = DriveCred(store)
-    eng = Engine(store, adapters={"drive_evidence": drive_evidence_live(cred.client, opts)})
+    eng = Engine(store, adapters={"drive_evidence": drive_evidence_live(cred.client, opts)}, async_review=True)
     for t, st in eng.boot_reconcile():
         log("RECONCILE %s -> %s (restart; no replay)" % (t, st))
     if opts.get("mode") == "selftest":
@@ -1511,7 +2505,13 @@ def serve():
                 pass
         except Exception as ex:
             log("DRIVE poll error class=%s" % type(ex).__name__)
-        time.sleep(5)
+        try:
+            for t, s2 in eng.watchdog_tick():
+                log("WATCHDOG %s -> %s (bounded stall/budget; no retry)" % (t, s2))
+            eng.heartbeat()
+        except Exception as ex:
+            log("HEARTBEAT error class=%s" % type(ex).__name__)
+        time.sleep(HEARTBEAT_SECONDS)
 
 
 # ============================== deterministic selftest (Phase E matrix) ==============================
@@ -1528,16 +2528,47 @@ def run_selftest():
         def __call__(self):
             return self.t
 
+    ROLE_OF = {"propose": "designer", "revise": "designer", "cancel": "designer", "claim": "executor",
+               "begin": "executor", "result": "executor", "reconcile": "reconciler"}
+
     def env(op, txn, **kw):
         d = {"protocol": PROTOCOL, "op": op, "txn_id": txn, "envelope_id": "e-" + secrets.token_hex(6)}
+        if op in ROLE_OF:
+            d["role"] = ROLE_OF[op]
+        if op == "propose":
+            d["changed_condition"] = "selftest-variant"
         d.update(kw)
+        d = {k: v for k, v in d.items() if v is not None}
         return json.dumps(d)
 
     def prop(**kw):
         p = {"op": "synthetic.echo", "target": "synthetic:echo", "value": {"n": 1}, "scope": "synthetic-only",
-             "effect": "echo a synthetic value", "summary": "selftest", "ttl_seconds": 600, "route": "mock"}
+             "effect": "echo a synthetic value", "summary": "selftest", "ttl_seconds": 600, "route": "mock",
+             "review_route": "mock-reviewer"}
+        if kw.get("route") in PROVIDERS:
+            p["review_route"] = "openai-api"
         p.update(kw)
         return p
+
+    def claim_env(txn, executor, pk, **kw):
+        ep = pk["package"]["exec_package"]
+        d = dict(executor=executor, package_sha256=pk["package_sha256"], package_digest=pk["package"]["package_digest"],
+                 operation=ep["operation"], target=ep["targets"][0])
+        d.update(kw)
+        return env("claim", txn, **d)
+
+    RV = {"q": []}          # deterministic mock reviewer: queue of (verdict, evidence_status) or callables
+
+    def mock_reviewer(kind, payload):
+        RV.setdefault("calls", []).append(kind)
+        item = RV["q"].pop(0) if RV["q"] else (("NO_OBJECTION" if kind == "design" else "ACCEPT"), "VERIFICATION_EVIDENCE")
+        if callable(item):
+            return item(kind, payload)
+        if isinstance(item, Exception):
+            raise item
+        return {"verdict": item[0], "issue_code": "NONE" if item[0] in ("ACCEPT", "NO_OBJECTION") else "TEST_ISSUE",
+                "claim": "selftest", "evidence_status": item[1], "txn_id": payload["txn_id"],
+                "package_digest": payload["package_digest"], "correlation_id": payload["correlation_id"]}
 
     OWNER = "owner-test-id"
     global OWNER_PIN
@@ -1552,7 +2583,7 @@ def run_selftest():
             def fake_drive(rec):
                 ev["n"] += 1
                 return {"mode": "drive", "status": "ARCHIVED_VERIFIED", "sha256": "x", "integrity": "MATCH"}
-            e = Engine(st, adapters={"drive_evidence": fake_drive}, clock=clk)
+            e = Engine(st, adapters={"drive_evidence": fake_drive, "mock-reviewer": mock_reviewer}, clock=clk)
 
             def authorize(txn, decision="authorize", uid=OWNER, peer=INGRESS_GATEWAY, h=None, nonce=None, sv=None):
                 v = e.view(txn, owner=True)
@@ -1593,10 +2624,9 @@ def run_selftest():
             chk("exact-retrieval-hash", pk["package_sha256"] == sha(canon(pk["package"])))
             chk("claim-wrong-package-hash-denied",
                 e.apply_envelope(env("claim", T, executor="claude", package_sha256="0" * 64)).get("code") == "HASH_MISMATCH")
-            c = e.apply_envelope(env("claim", T, executor="claude", package_sha256=pk["package_sha256"]))
+            c = e.apply_envelope(claim_env(T, "claude", pk))
             chk("claim->CLAIMED", c.get("state") == "CLAIMED")
-            chk("concurrent-claim-denied",
-                e.apply_envelope(env("claim", T, executor="other", package_sha256=pk["package_sha256"])).get("code") == "ALREADY_CLAIMED")
+            chk("concurrent-claim-denied", e.apply_envelope(claim_env(T, "other", pk)).get("code") == "ALREADY_CLAIMED")
             b = e.apply_envelope(env("begin", T, claim_id=c["claim_id"]))
             chk("begin->RUNNING", b.get("state") == "RUNNING")
             res = {"echo": {"n": 1}, "txn_id": T, "proposal_sha256": v0["proposal_sha256"]}
@@ -1604,7 +2634,7 @@ def run_selftest():
                 e.apply_envelope(env("result", T, claim_id=c["claim_id"], result=res, result_sha256="0" * 64)).get("code") == "RESULT_HASH_MISMATCH")
             renv = env("result", T, claim_id=c["claim_id"], result=res, result_sha256=sha(canon(res)))
             r = e.apply_envelope(renv)
-            chk("result->COMPLETED(with drive evidence)", r.get("state") == "COMPLETED" and ev["n"] == 1)
+            chk("result->COMPLETED(with drive evidence)", r.get("state") == "REVIEWING" and st.get(T)["state"] == "COMPLETED" and ev["n"] == 1)
             chk("envelope-replay-no-second-effect", e.apply_envelope(renv).get("replay") is True and ev["n"] == 1)
             chk("duplicate-execution-denied",
                 e.apply_envelope(env("result", T, claim_id=c["claim_id"], result=res, result_sha256=sha(canon(res)))).get("outcome") == "DENIED")
@@ -1643,10 +2673,10 @@ def run_selftest():
             e.apply_envelope(env("propose", T5, proposal=prop()))
             authorize(T5)
             p5 = e.package(T5)
-            c5 = e.apply_envelope(env("claim", T5, executor="claude", package_sha256=p5["package_sha256"]))
+            c5 = e.apply_envelope(claim_env(T5, "claude", p5))
             clk.t += LEASE_SECONDS + 5
             chk("stale-lease->UNKNOWN_RECONCILE(no takeover)",
-                e.apply_envelope(env("claim", T5, executor="other", package_sha256=p5["package_sha256"])).get("code") == "STALE_LEASE_RECONCILE"
+                e.apply_envelope(claim_env(T5, "other", p5)).get("code") == "STALE_LEASE_RECONCILE"
                 and st.get(T5)["state"] == "UNKNOWN_RECONCILE")
 
             # --- interrupted maybe-write + restart ---
@@ -1654,7 +2684,7 @@ def run_selftest():
             e.apply_envelope(env("propose", T6, proposal=prop()))
             authorize(T6)
             p6 = e.package(T6)
-            c6 = e.apply_envelope(env("claim", T6, executor="claude", package_sha256=p6["package_sha256"]))
+            c6 = e.apply_envelope(claim_env(T6, "claude", p6))
             e.apply_envelope(env("begin", T6, claim_id=c6["claim_id"]))
             e2 = Engine(Store(os.path.join(td, "gaop")), clock=clk)          # simulated restart
             rr = dict(e2.boot_reconcile())
@@ -1671,7 +2701,7 @@ def run_selftest():
                 e.apply_envelope(env("propose", "TXN-ST-0010", proposal=prop(op="ha.call_service"))).get("code") == "OP_NOT_ALLOWLISTED")
             chk("non-synthetic-target-denied",
                 e.apply_envelope(env("propose", "TXN-ST-0011", proposal=prop(target="light.kitchen"))).get("code") == "SCOPE_NOT_SYNTHETIC")
-            chk("duplicate-txn-denied", e.apply_envelope(env("propose", T, proposal=prop())).get("code") == "DUPLICATE_TXN")
+            chk("duplicate-txn-denied", e.apply_envelope(env("propose", T, proposal=prop(value={"n": 77}))).get("code") == "DUPLICATE_TXN")
 
             # --- unconfigured live provider fails closed ---
             T12 = "TXN-ST-0012"
@@ -1683,9 +2713,9 @@ def run_selftest():
             def ep(**kw):
                 calls.append(sorted(kw))
                 return AdapterResult(status="DISPATCHED", mode="api", ack="a1", locator=kw["locator"])
-            e.adapters["openai-api"] = ApiAdapter("openai-api", "/nonexistent", endpoint=ep)
+            e.adapters["claude-api"] = ApiAdapter("claude-api", "/nonexistent", endpoint=ep)
             T13 = "TXN-ST-0013"
-            e.apply_envelope(env("propose", T13, proposal=prop(route="openai-api")))
+            e.apply_envelope(env("propose", T13, proposal=prop(route="claude-api", value={"n": 13})))
             chk("synthetic-provider-contract", authorize(T13).get("state") == "DISPATCHED" and calls and calls[0] ==
                 sorted(["txn_id", "locator", "package_sha256", "action_id", "expires_at", "idempotency_key"]))
 
@@ -1699,7 +2729,7 @@ def run_selftest():
             chk("provider-bad-key-rejected", denied(lambda: save_provider_cred(st, "claude-api", "not-a-key", ""), "MALFORMED"))
             chk("openai-model-required", denied(lambda: save_provider_cred(st, "openai-api", KEY_O, ""), "MALFORMED"))
             pcalls = {"n": 0}
-            e.adapters.pop("openai-api", None)   # drop the 0.7.1 mock-endpoint adapter
+            e.adapters.pop("claude-api", None)   # drop the 0.7.1 mock-endpoint adapter
 
             def mk(vendor, mutate=None, status=200, raise_kind=None, text_override=None, hook=None):
                 def tr(url, headers, body, timeout):
@@ -1723,31 +2753,55 @@ def run_selftest():
                     return status, {"x-request-id": "req_o"}, json.dumps(j).encode()
                 return tr
 
+            def mk_review(verdicts=None, status=200):
+                q = list(verdicts or [])
+
+                def tr(url, headers, body, timeout):
+                    pcalls.setdefault("rv", 0)
+                    pcalls["rv"] += 1
+                    assert url == PROVIDERS["openai-api"]["url"] and headers["Authorization"] == "Bearer " + KEY_O
+                    b = json.loads(body.decode())
+                    assert b["messages"][0]["content"] == REVIEW_SYSTEM and "max_completion_tokens" in b
+                    u = b["messages"][-1]["content"]
+                    pl = json.loads(u[u.index("PAYLOAD=") + 8:])
+                    vd = q.pop(0) if q else ("ACCEPT" if pl["kind"] == "verify" else "NO_OBJECTION", "VERIFICATION_EVIDENCE")
+                    o = {"verdict": vd[0], "issue_code": "NONE", "claim": "ok", "evidence_status": vd[1],
+                         "txn_id": pl["txn_id"], "package_digest": pl["package_digest"], "correlation_id": pl["correlation_id"]}
+                    j = {"id": "chatcmpl_rv", "model": b["model"], "choices": [{"message": {"content": json.dumps(o)}}]}
+                    return status, {"x-request-id": "req_rv"}, json.dumps(j).encode()
+                return tr
+            e.transport = mk_review()
+
             def api_txn(tid, route, evidence="drive"):
-                e.apply_envelope(env("propose", tid, proposal=prop(route=route, evidence=evidence)))
+                e.apply_envelope(env("propose", tid, proposal=prop(route=route, evidence=evidence, value={"n": 1, "t": tid})))
                 return authorize(tid)
 
             T20 = "TXN-ST-0020"
             chk("api-authorize->DISPATCHED", api_txn(T20, "claude-api").get("state") == "DISPATCHED")
             chk("api-route-envelope-claim-denied",
-                e.apply_envelope(env("claim", T20, executor="rogue", package_sha256=e.package(T20)["package_sha256"])).get("code") == "ADAPTER_OWNED_ROUTE")
+                e.apply_envelope(claim_env(T20, "rogue", e.package(T20))).get("code") == "ADAPTER_OWNED_ROUTE")
             r20 = e.api_execute(T20, transport=mk("anthropic"))
             rc20 = st.get(T20)["receipt"]
-            chk("anthropic-live-path->COMPLETED", r20.get("state") == "COMPLETED"
+            chk("anthropic-live-path->COMPLETED", r20.get("state") == "REVIEWING"
                 and rc20["provider_response_id"] == "msg_test" and rc20["provider_request_id"] == "req_a"
-                and rc20["provider_correlation_id"].startswith("corr-") and rc20["schema"] == "gaop.receipt.v2")
+                and rc20["provider_correlation_id"].startswith("corr-") and rc20["schema"] == "gaop.receipt.v3"
+                and st.get(T20)["state"] == "COMPLETED" and rc20["review_route"] == "openai-api"
+                and rc20["review_response_id"] == "chatcmpl_rv" and rc20["review_verdict"] == "ACCEPT")
             n0 = pcalls["n"]
             chk("duplicate-provider-execution-denied", denied(lambda: e.api_execute(T20, transport=mk("anthropic")), "WRONG_STATE") and pcalls["n"] == n0)
 
             T21 = "TXN-ST-0021"
-            api_txn(T21, "openai-api", evidence="none")
+            chk("openai-as-executor-denied(provider-role)",
+                e.apply_envelope(env("propose", "TXN-ST-0021X", proposal=prop(route="openai-api", review_route="openai-api"))).get("code") == "PROVIDER_ROLE_VIOLATION")
+            api_txn(T21, "claude-api", evidence="none")
             rogue = {}
 
             def rogue_hook():
                 rogue["out"] = e.apply_envelope(env("result", T21, claim_id="clm-guess", result={"echo": 1},
                                                     result_sha256=sha(canon({"echo": 1}))))
-            r21 = e.api_execute(T21, transport=mk("openai", hook=rogue_hook))
-            chk("openai-live-path->COMPLETED", r21.get("state") == "COMPLETED" and st.get(T21)["receipt"]["provider_request_id"] == "req_o")
+            r21 = e.api_execute(T21, transport=mk("anthropic", hook=rogue_hook))
+            chk("anthropic-exec+openai-review->COMPLETED", st.get(T21)["state"] == "COMPLETED"
+                and st.get(T21)["receipt"]["provider_request_id"] == "req_a" and st.get(T21)["receipt"]["review_request_id"] == "req_rv")
             chk("rogue-result-during-api-run-denied", rogue["out"].get("code") == "ADAPTER_OWNED_CLAIM")
 
             def outcome(tid, route, **kw):
@@ -1757,7 +2811,7 @@ def run_selftest():
             chk("provider-auth-failure->STOP", o.get("state") == "STOP" and rr["provider"]["status"] == "AUTH")
             o, rr = outcome("TXN-ST-0023", "claude-api", raise_kind="UNCERTAIN")
             chk("provider-timeout->UNKNOWN_RECONCILE(no retry)", o.get("state") == "UNKNOWN_RECONCILE")
-            o, rr = outcome("TXN-ST-0024", "openai-api", status=503)
+            o, rr = outcome("TXN-ST-0024", "claude-api", status=503)
             chk("provider-5xx->UNKNOWN_RECONCILE", o.get("state") == "UNKNOWN_RECONCILE")
             o, rr = outcome("TXN-ST-0025", "claude-api", text_override="I cannot do that")
             chk("provider-malformed->STOP", o.get("state") == "STOP" and rr["provider"]["status"] == "MALFORMED")
@@ -1766,7 +2820,7 @@ def run_selftest():
             o, rr = outcome("TXN-ST-0027", "claude-api", mutate=lambda x: x.update(txn_id="TXN-OTHER"))
             chk("provider-wrong-txn->STOP", o.get("state") == "STOP")
             o, rr = outcome("TXN-ST-0028", "claude-api", mutate=lambda x: x.update(echo={"n": 999}))
-            chk("provider-wrong-echo->STOP(verification)", o.get("state") == "STOP" and rr["result"] is not None)
+            chk("provider-wrong-echo->STOP(verification)", o.get("state") == "STOP" and st.get("TXN-ST-0028")["result"] is not None)
 
             # credentials never leak to logs / receipts / views / packages
             blob = json.dumps(LOG_SINK) + json.dumps([st.get(t) and st.get(t).get("receipt") for t in ("TXN-ST-0020", "TXN-ST-0021")]) \
@@ -1825,7 +2879,7 @@ def run_selftest():
             chk("reconcile-unknown->CANCELLED(record+interruption kept)", rc.get("state") == "CANCELLED"
                 and r6["reconcile"]["resolution"] == "CANCELLED" and r6["reconcile"]["interruption"]["reason"].startswith("INTERRUPTED_")
                 and r6["receipt"]["reconcile_resolution"] == "CANCELLED" and r6["history"])
-            chk("reconcile-wrong-state-denied", e.apply_envelope(env("reconcile", T, resolution="CANCELLED", reconciler="x")).get("code") == "WRONG_STATE")
+            chk("reconcile-wrong-state-denied", e.apply_envelope(env("reconcile", T, resolution="CANCELLED", reconciler="x")).get("code") == "WRONG_STAGE")
             T29 = "TXN-ST-0029"
             e.apply_envelope(env("propose", T29, proposal=prop()))
             x = st.get(T29)
@@ -1846,6 +2900,399 @@ def run_selftest():
             chk("request-entry-bad-value-denied", denied(lambda: e.owner_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER,
                                                                                  value="<script>", route="claude-api", evidence="none"), "MALFORMED"))
             chk("recent-results-index(bounded,newest-last)", st.recent()[-1] == "TXN-ST-0023" and len(st.recent()) == 8)
+            # ================= v0.8.0 production build (DAI-IN-509) =================
+            # Fresh engine/store so v0.8 checks are independent of the v0.7 regression state above.
+            st8 = Store(os.path.join(td, "gaop8"))
+            save_provider_cred(st8, "claude-api", KEY_A, "")
+            save_provider_cred(st8, "openai-api", KEY_O, "test-model")
+            ev8 = {"n": 0}
+
+            def fd8(rec):
+                ev8["n"] += 1
+                return {"mode": "drive", "status": "ARCHIVED_VERIFIED", "sha256": "x", "integrity": "MATCH"}
+            e8 = Engine(st8, adapters={"drive_evidence": fd8, "mock-reviewer": mock_reviewer}, clock=clk, transport=mk_review())
+
+            def auth8(txn, decision="authorize"):
+                v = e8.view(txn, owner=True)
+                return e8.owner_decision(peer=INGRESS_GATEWAY, remote_user_id=OWNER, txn_id=txn,
+                                         proposal_sha256=v["proposal_sha256"], state_version=v["state_version"],
+                                         nonce=v.get("pending_nonce") or "", decision=decision)
+
+            def P(txn, cc="selftest-variant", **kw):
+                return e8.apply_envelope(env("propose", txn, proposal=prop(**kw), changed_condition=cc))
+
+            def pull_run(txn, **kw):
+                """propose(mock) -> authorize -> claim -> begin; returns (claim_id, package)."""
+                P(txn, **kw)
+                auth8(txn)
+                pk = e8.package(txn)
+                c = e8.apply_envelope(claim_env(txn, "claude", pk))
+                e8.apply_envelope(env("begin", txn, claim_id=c.get("claim_id")))
+                return c.get("claim_id"), pk
+
+            def good_result(txn):
+                r = st8.get(txn)
+                return {"echo": r["exec_package"]["parameters"], "txn_id": txn, "proposal_sha256": r["proposal_sha256"]}
+
+            def submit(txn, cid, res=None):
+                res = res or good_result(txn)
+                return e8.apply_envelope(env("result", txn, claim_id=cid, result=res, result_sha256=sha(canon(res))))
+
+            # ---------- R1 exact package / digest / authority binding ----------
+            pp = validate_proposal(prop(value={"r1": 1}))
+            d1 = package_digest(build_exec_package("TXN-R1-0001", 1, pp, 1900000000, "n1"))
+            d1b = package_digest(build_exec_package("TXN-R1-0001", 1, dict(pp), 1900000000, "n1"))
+            chk("R1 identical-package->identical-digest", d1 == d1b)
+            variants = [("value", {"r1": 2}), ("target", "synthetic:other"), ("scope", "other-scope"), ("effect", "other"),
+                        ("budgets", {"provider_calls": 2}), ("verify", ["bound_txn"]), ("preserve", ["x"]), ("route", "claude-session")]
+            diffs = [package_digest(build_exec_package("TXN-R1-0001", 1, dict(pp, **{k: val}), 1900000000, "n1")) != d1 for k, val in variants]
+            diffs += [package_digest(build_exec_package("TXN-R1-0001", 2, pp, 1900000000, "n1")) != d1,
+                      package_digest(build_exec_package("TXN-R1-0001", 1, pp, 1900000001, "n1")) != d1,
+                      package_digest(build_exec_package("TXN-R1-0001", 1, pp, 1900000000, "n2")) != d1,
+                      package_digest(build_exec_package("TXN-R1-0002", 1, pp, 1900000000, "n1")) != d1]
+            chk("R1 every-material-field-change->different-digest(12)", all(diffs) and len(diffs) == 12)
+            TA = "TXN-R1-0010"
+            P(TA, route="claude-api", value={"r1": "a"})
+            auth8(TA)
+            ra = st8.get(TA)
+            chk("R1 authority-record-binds-package-digest", ra["authority"]["package_digest"] == ra["package_digest"]
+                == package_digest(ra["exec_package"]) and ra["authority"]["authority_sha256"] == authority_body_digest(ra["authority"]))
+            ra["exec_package"]["parameters"] = {"r1": "SUBSTITUTE"}                 # post-authority regenerated substitute
+            st8.put(ra, ra["state_version"])
+            n0 = pcalls["n"]
+            chk("R1 post-authority-material-change->rejected+STOP(no provider call)",
+                denied(lambda: e8.api_execute(TA, transport=mk("anthropic")), "PACKAGE_DIGEST_MISMATCH")
+                and st8.get(TA)["state"] == "STOP" and pcalls["n"] == n0)
+            TB = "TXN-R1-0011"
+            P(TB, value={"r1": "b"})
+            auth8(TB)
+            pkb = e8.package(TB)
+            chk("R1 claim-digest-mismatch-rejected", e8.apply_envelope(claim_env(TB, "claude", pkb, package_digest="0" * 64)).get("code") == "PACKAGE_DIGEST_MISMATCH")
+            rb = st8.get(TB)
+            rb["authority"]["scope"] = "widened"                                    # forged authority body
+            st8.put(rb, rb["state_version"])
+            chk("R1 invalid-authority-fails-closed", e8.apply_envelope(claim_env(TB, "claude", pkb)).get("code") == "AUTHORITY_INVALID"
+                and st8.get(TB)["state"] == "STOP")
+            TC = "TXN-R1-0012"
+            P(TC, value={"r1": "c"}, ttl_seconds=60)
+            auth8(TC)
+            pkc = e8.package(TC)
+            clk.t += 61
+            chk("R1 expired-authority-fails-closed", e8.apply_envelope(claim_env(TC, "claude", pkc)).get("code") == "EXPIRED"
+                and st8.get(TC)["state"] == "EXPIRED")
+            ax = dict(ra["authority"], expires_at=0)
+            ax["authority_sha256"] = authority_body_digest(ax)
+            chk("R1 expired-authority-binding-check", denied(lambda: e8._check_binding(dict(ra, authority=ax)), "AUTHORITY_EXPIRED"))
+
+            # ---------- R2 idempotency / repeat-work protection ----------
+            TD = "TXN-R2-0001"
+            cid, pkd = pull_run(TD, value={"r2": 1})
+            rd = submit(TD, cid)
+            chk("R2 pull-flow->COMPLETED", st8.get(TD)["state"] == "COMPLETED")
+            dup = json.dumps({"protocol": PROTOCOL, "op": "cancel", "txn_id": TD, "role": "designer", "envelope_id": "e-fixed"})
+            e8.apply_envelope(dup)
+            chk("R2 duplicate-envelope-id(different bytes)-rejected",
+                e8.apply_envelope(json.dumps({"protocol": PROTOCOL, "op": "cancel", "txn_id": TD, "role": "designer",
+                                              "envelope_id": "e-fixed", "x": 1})).get("code") == "DUPLICATE_ENVELOPE")
+            chk("R2 identical-envelope-replay->recorded-outcome", e8.apply_envelope(dup).get("replay") is True)
+            rr2 = submit(TD, cid)
+            chk("R2 replay-after-completion->existing-terminal-receipt",
+                rr2.get("code") == "ALREADY_TERMINAL" and rr2.get("existing", {}).get("receipt_sha256") == st8.get(TD)["receipt"]["receipt_sha256"])
+            chk("R2 claim-after-completion->existing-terminal", e8.apply_envelope(claim_env(TD, "x", pkd)).get("code") == "ALREADY_TERMINAL")
+            o2 = P("TXN-R2-0002", cc=None, value={"r2": 1})
+            chk("R2 repeated-completed-request->existing-receipt(no new txn)",
+                o2.get("code") == "DUPLICATE_OPERATION" and o2["existing"]["txn_id"] == TD and st8.get("TXN-R2-0002") is None)
+            o3 = P("TXN-R2-0003", cc="material change: target state reset by owner", value={"r2": 1})
+            chk("R2 changed-condition->new-txn-needs-fresh-authority",
+                o3.get("state") == "AWAITING_AUTHORITY" and st8.get("TXN-R2-0003")["authority"] is None)
+            # concurrent claim race: two engines (separate lock fds) on the same store, released together
+            TE = "TXN-R2-0004"
+            P(TE, value={"r2": "race"})
+            auth8(TE)
+            pke = e8.package(TE)
+            eA = Engine(Store(os.path.join(td, "gaop8")), clock=clk)
+            eB = Engine(Store(os.path.join(td, "gaop8")), clock=clk)
+            outs, gate = [], threading.Barrier(2)
+
+            def racer(en, who):
+                gate.wait()
+                outs.append(en.apply_envelope(claim_env(TE, who, pke)))
+            ths = [threading.Thread(target=racer, args=(eA, "a")), threading.Thread(target=racer, args=(eB, "b"))]
+            [t.start() for t in ths]
+            [t.join() for t in ths]
+            chk("R2 concurrent-claim-race->exactly-one-claim",
+                sorted(o.get("state") or o.get("code") for o in outs) == ["ALREADY_CLAIMED", "CLAIMED"])
+            re_ = st8.get(TE)
+            re_["state"], re_["claim"] = "DISPATCHED", None                         # forged rewind to re-run consumed authority
+            st8.put(re_, re_["state_version"])
+            chk("R2 one-time-authority-consumed->no-second-claim", e8.apply_envelope(claim_env(TE, "c", pke)).get("code") == "AUTHORITY_CONSUMED")
+            # restart: resume from verified checkpoint without repeating the consequential stage
+            TF = "TXN-R2-0005"
+            cidf, _ = pull_run(TF, value={"r2": "resume"})
+            rf = st8.get(TF)
+            res_f = good_result(TF)
+            rf["result"] = {"result": res_f, "result_sha256": sha(canon(res_f)), "persisted_at": clk.t,
+                            "executor": rf["claim"]["executor"], "package_digest": rf["package_digest"]}
+            rf["execution"]["maybe_write"] = False
+            transition(rf, "RESULT_PERSISTED", "crash after result persisted", at=clk.t)
+            st8.put(rf, rf["state_version"])                                        # verified checkpoint; then "crash"
+            chk("R2 checkpoint-literally-verified", st8.get(TF)["last_checkpoint"]["verified"] is True
+                and st8.get(TF)["last_checkpoint"]["stage"] == "RESULT_PERSISTED")
+            nexec = pcalls["n"]
+            eR = Engine(Store(os.path.join(td, "gaop8")), adapters={"mock-reviewer": mock_reviewer, "drive_evidence": fd8}, clock=clk)
+            br = dict(eR.boot_reconcile())
+            chk("R2 restart-resumes-from-checkpoint(no re-execution)", br.get(TF) == "RESUMED_REVIEWING"
+                and st8.get(TF)["state"] == "COMPLETED" and pcalls["n"] == nexec and st8.get(TF)["result"]["result"] == res_f)
+            chk("R2 second-restart-no-repeat", TF not in dict(Engine(Store(os.path.join(td, "gaop8")), clock=clk).boot_reconcile()))
+            TG = "TXN-R2-0006"
+            P(TG, route="claude-api", value={"r2": "amb"})
+            auth8(TG)
+            ng = pcalls["n"]
+            og = e8.api_execute(TG, transport=mk("anthropic", raise_kind="UNCERTAIN"))
+            chk("R2 ambiguous-outcome->UNKNOWN_RECONCILE(no blind retry)", og.get("state") == "UNKNOWN_RECONCILE"
+                and pcalls["n"] == ng + 1 and denied(lambda: e8.api_execute(TG, transport=mk("anthropic")), "WRONG_STATE") and pcalls["n"] == ng + 1)
+
+            # ---------- R3 transaction/stage-scoped capability exposure ----------
+            TH = "TXN-R3-0001"
+            P(TH, value={"r3": 1})
+            auth8(TH)
+            pkh = e8.package(TH)
+            chk("R3 wrong-stage-denied(begin before claim)", e8.apply_envelope(env("begin", TH, claim_id="clm-x")).get("code") == "WRONG_STAGE")
+            chk("R3 wrong-operation-denied", e8.apply_envelope(claim_env(TH, "claude", pkh, operation="ha.call_service")).get("code") == "SCOPE_MISMATCH")
+            chk("R3 wrong-target-denied", e8.apply_envelope(claim_env(TH, "claude", pkh, target="synthetic:other")).get("code") == "SCOPE_MISMATCH")
+            chk("R3 wrong-transaction-scope-denied", e8.apply_envelope(claim_env("TXN-R3-0099", "claude", pkh)).get("code") == "UNKNOWN_TXN")
+            chk("R3 reviewer-mutation-denied(claim/result/propose/cancel)", all(
+                e8.apply_envelope(env(op, TH, role="reviewer", **kw)).get("code") == "REVIEWER_MUTATION_DENIED"
+                for op, kw in (("claim", {}), ("result", {}), ("propose", {"proposal": prop()}), ("cancel", {}), ("reconcile", {}))))
+            chk("R3 executor-extra-capability-denied(review/propose/reconcile)", all(
+                e8.apply_envelope(env(op, TH, role="executor", **kw)).get("code") == "CAPABILITY_DENIED"
+                for op, kw in (("review", {}), ("propose", {"proposal": prop()}), ("reconcile", {}), ("revise", {}))))
+            chk("R3 missing-role-denied", e8.apply_envelope(json.dumps({"protocol": PROTOCOL, "op": "claim", "txn_id": TH,
+                                                                        "envelope_id": "e-norole"})).get("code") == "MALFORMED")
+            chk("R3 alternate-route(direct method)-denied", denied(lambda: e8._op_claim(json.loads(claim_env(TH, "x", pkh, role="reviewer"))),
+                                                                     "REVIEWER_MUTATION_DENIED"))
+            rh = st8.get(TH)
+            rh["proposal"]["route"] = "openai-api"                                  # alternate provider route for same capability
+            st8.put(rh, rh["state_version"])
+            nh = pcalls["n"]
+            chk("R3 alternate-provider-route-bypass-denied", denied(lambda: e8.api_execute(TH, transport=mk("openai")), "PROVIDER_ROLE_VIOLATION")
+                and pcalls["n"] == nh)
+            chk("R3 transport-auth-is-not-authority(authority field rejected)", e8.apply_envelope(env("claim", TH, authorization="Bearer x")).get("code") == "AUTHORITY_FIELD_REJECTED")
+            chk("R3 provider-cannot-create-owner-authority", denied(lambda: e8.owner_decision(
+                peer=INGRESS_GATEWAY, remote_user_id="openai-api", txn_id=TH, proposal_sha256="x", state_version=1, nonce="x",
+                decision="authorize"), "NOT_OWNER"))
+
+            # ---------- provider-role enforcement ----------
+            chk("ROLE claude-as-reviewer-denied", P("TXN-RL-0001", route="claude-api", review_route="claude-api").get("code") == "PROVIDER_ROLE_VIOLATION"
+                and P("TXN-RL-0001B", route="claude-api", review_route="claude-session").get("code") == "PROVIDER_ROLE_VIOLATION")
+            chk("ROLE openai-as-executor-denied", P("TXN-RL-0002", route="openai-api").get("code") == "PROVIDER_ROLE_VIOLATION")
+            chk("ROLE mock-reviewer-only-with-mock", P("TXN-RL-0003", route="claude-api", review_route="mock-reviewer").get("code") == "PROVIDER_ROLE_VIOLATION")
+            chk("ROLE authority-binds-roles", st8.get(TG)["authority"]["roles"] == {"executor": "claude-api", "reviewer": "openai-api"})
+
+            # ---------- budgets / oversize ----------
+            chk("BUDGET above-policy-denied", P("TXN-BG-0001", budgets={"provider_calls": 99}).get("code") == "BUDGET_ABOVE_POLICY")
+            chk("BUDGET unknown-key-denied", P("TXN-BG-0002", budgets={"gpu_hours": 1}).get("code") == "MALFORMED")
+            P("TXN-BG-0003", route="claude-api", value={"bg": 3}, budgets={"provider_calls": 0})
+            auth8("TXN-BG-0003")
+            nb = pcalls["n"]
+            chk("BUDGET provider-calls-exhausted->STOP(no call)", denied(lambda: e8.api_execute("TXN-BG-0003", transport=mk("anthropic")), "BUDGET_EXHAUSTED")
+                and st8.get("TXN-BG-0003")["state"] == "STOP" and pcalls["n"] == nb)
+            P("TXN-BG-0004", route="claude-api", value={"bg": 4}, budgets={"output_tokens": 5})
+            auth8("TXN-BG-0004")
+            o4 = e8.api_execute("TXN-BG-0004", transport=mk("anthropic"))
+            chk("BUDGET oversize-output->STOP(bounded)", o4.get("provider") == "OVER_BUDGET" and st8.get("TXN-BG-0004")["state"] == "STOP")
+            P("TXN-BG-0005", value={"bg": 5}, budgets={"tool_calls": 1})
+            auth8("TXN-BG-0005")
+            pk5 = e8.package("TXN-BG-0005")
+            c5b = e8.apply_envelope(claim_env("TXN-BG-0005", "claude", pk5))
+            chk("BUDGET tool-calls-exhausted->STOP", e8.apply_envelope(env("begin", "TXN-BG-0005", claim_id=c5b.get("claim_id"))).get("code") == "BUDGET_EXHAUSTED"
+                and st8.get("TXN-BG-0005")["state"] == "STOP" and st8.get("TXN-BG-0005")["budget"]["exhausted"] == "tool_calls")
+            P("TXN-BG-0006", value={"bg": 6}, budgets={"elapsed_s": 60})
+            auth8("TXN-BG-0006")
+            e8.apply_envelope(claim_env("TXN-BG-0006", "claude", e8.package("TXN-BG-0006")))
+            clk.t += 61
+            chk("BUDGET elapsed-exhausted->visible-STOP(watchdog)", ("TXN-BG-0006", "STOP") in e8.watchdog_tick())
+            P("TXN-BG-0007", value={"bg": 7}, budgets={"retrieval_bytes": 100})
+            auth8("TXN-BG-0007")
+            chk("BUDGET retrieval-bytes-exhausted->STOP", denied(lambda: e8.package("TXN-BG-0007"), "BUDGET_EXHAUSTED") and st8.get("TXN-BG-0007")["state"] == "STOP")
+            # retries: one counted retry only for a clearly failed non-consequential review read
+            RV["q"] = [ProviderError("MALFORMED", "x"), ("ACCEPT", "VERIFICATION_EVIDENCE")]
+            c8, _ = pull_run("TXN-BG-0008", value={"bg": 8}, budgets={"retries": 1})
+            submit("TXN-BG-0008", c8)
+            r8 = st8.get("TXN-BG-0008")
+            chk("BUDGET retry=1 counted-retry-then-COMPLETED", r8["state"] == "COMPLETED" and r8["budget"]["used"]["retries"] == 1 and r8["retry_log"])
+            RV["q"] = [ProviderError("MALFORMED", "x")]
+            c9, _ = pull_run("TXN-BG-0009", value={"bg": 9})
+            submit("TXN-BG-0009", c9)
+            chk("BUDGET retry=0 no-retry->PARTIAL", st8.get("TXN-BG-0009")["state"] == "PARTIAL" and st8.get("TXN-BG-0009")["budget"]["used"]["retries"] == 0)
+            RV["q"] = [ProviderError("UNCERTAIN", "timeout")]
+            c10, _ = pull_run("TXN-BG-0010", value={"bg": 10}, budgets={"retries": 1})
+            submit("TXN-BG-0010", c10)
+            chk("BUDGET uncertain-review-never-retried->PARTIAL", st8.get("TXN-BG-0010")["state"] == "PARTIAL"
+                and st8.get("TXN-BG-0010")["budget"]["used"]["retries"] == 0)
+            chk("BUDGET oversize-envelope/result-bounded", e8.apply_envelope("{" + " " * MAX_ENVELOPE_BYTES + "}").get("code") == "OVERSIZE")
+
+            # ---------- liveness: heartbeat / checkpoint / stall / ETA ----------
+            TL = "TXN-LV-0001"
+            cl, _ = pull_run(TL, value={"lv": 1})
+            hb = e8.heartbeat()
+            lv = hb["txns"].get(TL) or {}
+            chk("LIVE heartbeat-shows-stage/elapsed/checkpoint", hb["period_s"] == 5 and lv.get("state") == "RUNNING"
+                and lv.get("last_checkpoint", {}).get("verified") is True and "stage_elapsed_s" in lv and st8.live_get()["heartbeat_at"] == clk.t)
+            chk("LIVE no-invented-ETA-without-stage-data", lv.get("eta_s") is None or isinstance(lv.get("eta_s"), int))
+            clk.t += STAGE_TIMEOUTS["RUNNING"] + 1
+            chk("LIVE stalled-RUNNING->UNKNOWN_RECONCILE(bounded,no retry)", (TL, "UNKNOWN_RECONCILE") in e8.watchdog_tick()
+                and "STALL_RUNNING" in st8.get(TL)["reconcile"]["reason"])
+            RV["q"] = [lambda k, p: (_ for _ in ()).throw(ProviderError("UNCERTAIN", "hang"))]
+            TL2 = "TXN-LV-0002"
+            cl2, _ = pull_run(TL2, value={"lv": 2})
+            r_ = st8.get(TL2)
+            eS = Engine(st8, adapters={"mock-reviewer": mock_reviewer}, clock=clk)   # review never delivered (stall)
+            r_["result"] = {"result": good_result(TL2), "result_sha256": sha(canon(good_result(TL2))), "persisted_at": clk.t,
+                            "executor": "claude", "package_digest": r_["package_digest"]}
+            transition(r_, "REVIEWING", "forced stall", at=clk.t)
+            st8.put(r_, r_["state_version"])
+            clk.t += STAGE_TIMEOUTS["REVIEWING"] + 1
+            chk("LIVE stalled-REVIEWING->PARTIAL(result kept)", (TL2, "PARTIAL") in eS.watchdog_tick() and st8.get(TL2)["result"])
+            RV["q"] = []
+            # forced interruption mid-review + restart: visible PARTIAL, last checkpoint preserved, no re-execution
+            TL3 = "TXN-LV-0003"
+            cl3, _ = pull_run(TL3, value={"lv": 3})
+            r3 = st8.get(TL3)
+            r3["result"] = {"result": good_result(TL3), "result_sha256": sha(canon(good_result(TL3))), "persisted_at": clk.t,
+                            "executor": "claude", "package_digest": r3["package_digest"]}
+            transition(r3, "REVIEWING", "interrupted", at=clk.t)
+            st8.put(r3, r3["state_version"])
+            cpv = st8.get(TL3)["last_checkpoint"]["state_version"]
+            br3 = dict(Engine(Store(os.path.join(td, "gaop8")), clock=clk).boot_reconcile())
+            chk("LIVE forced-interruption->PARTIAL+checkpoint-preserved", br3.get(TL3) == "PARTIAL"
+                and st8.get(TL3)["history"][-1][1] == "REVIEWING" and st8.get(TL3)["receipt"]["last_checkpoint_state_version"] >= cpv)
+            stats = {"claude-api": {s: [5, 6, 7] for s in FLOW}}
+            st8.stats_put(stats)
+            P("TXN-LV-0004", route="claude-api", value={"lv": 4})
+            chk("LIVE ETA-only-with-observed-stage-data", isinstance(e8.live_view(st8.get("TXN-LV-0004"))["eta_s"], int))
+
+            # ---------- execution result / receipt binding ----------
+            rc = st8.get(TD)["receipt"]
+            chk("BIND receipt-binds-package/result/review/verification", rc["package_digest"] == st8.get(TD)["package_digest"]
+                and rc["authority_package_digest"] == rc["package_digest"] and rc["result_sha256"] == st8.get(TD)["result"]["result_sha256"]
+                and rc["deterministic_verification"] == "PASS" and rc["review_verdict"] == "ACCEPT"
+                and rc["receipt_sha256"] == sha(canon({k: v for k, v in rc.items() if k != "receipt_sha256"})))
+            chk("BIND result-bound-to-package-digest", st8.get(TD)["result"]["package_digest"] == st8.get(TD)["package_digest"])
+
+            # ---------- independent ChatGPT machine-review path ----------
+            P("TXN-RV-0001", route="claude-api", value={"rv": 1}, evidence="none")
+            auth8("TXN-RV-0001")
+            e8.api_execute("TXN-RV-0001", transport=mk("anthropic"))
+            rv1 = st8.get("TXN-RV-0001")
+            chk("REVIEW openai-machine-review-path->COMPLETED", rv1["state"] == "COMPLETED" and rv1["review"]["route"] == "openai-api"
+                and rv1["review"]["model"] == "test-model" and rv1["review"]["request_id"] == "req_rv" and rv1["provider"]["vendor"] == "anthropic")
+            e8.transport = mk_review([("ACCEPT", "VERIFICATION_EVIDENCE")])
+            os.rename(provider_cred_path(st8, "openai-api"), provider_cred_path(st8, "openai-api") + ".off")
+            P("TXN-RV-0002", route="claude-api", value={"rv": 2}, evidence="none")
+            auth8("TXN-RV-0002")
+            e8.api_execute("TXN-RV-0002", transport=mk("anthropic"))
+            chk("REVIEW reviewer-unavailable->PARTIAL(not COMPLETED)", st8.get("TXN-RV-0002")["state"] == "PARTIAL"
+                and st8.get("TXN-RV-0002")["review"]["status"] == "UNAVAILABLE")
+            os.rename(provider_cred_path(st8, "openai-api") + ".off", provider_cred_path(st8, "openai-api"))
+            RV["q"] = [lambda k, p: {"verdict": "ACCEPT", "issue_code": "NONE", "claim": "x", "evidence_status": "VERIFICATION_EVIDENCE",
+                                     "txn_id": p["txn_id"], "package_digest": "0" * 64, "correlation_id": p["correlation_id"]}]
+            cb, _ = pull_run("TXN-RV-0003", value={"rv": 3})
+            submit("TXN-RV-0003", cb)
+            chk("REVIEW binding-mismatch->PARTIAL", st8.get("TXN-RV-0003")["state"] == "PARTIAL"
+                and st8.get("TXN-RV-0003")["review"]["status"] == "REVIEW_BINDING_MISMATCH")
+
+            # ---------- disagreement flows ----------
+            RV["q"] = [("DISAGREE_VERIFICATION", "INFERENCE"), ("ACCEPT", "VERIFICATION_EVIDENCE")]
+            cd1, _ = pull_run("TXN-DG-0001", value={"dg": 1})
+            submit("TXN-DG-0001", cd1)
+            g1 = st8.get("TXN-DG-0001")
+            chk("DISAGREE post-exec resolved-in-one-round->COMPLETED(no re-execution)", g1["state"] == "COMPLETED"
+                and g1["disagreement"]["outcome"] == "RESOLVED_NO_MATERIAL_CHANGE" and g1["disagreement"]["rounds_used"] == 1)
+            RV["q"] = [("DISAGREE_VERIFICATION", "FRESH_OBSERVATION"), ("DISAGREE_VERIFICATION", "FRESH_OBSERVATION")]
+            cd2, _ = pull_run("TXN-DG-0002", value={"dg": 2})
+            nrv = len(RV.get("calls", []))
+            submit("TXN-DG-0002", cd2)
+            g2 = st8.get("TXN-DG-0002")
+            chk("DISAGREE post-exec unresolved->PARTIAL+owner-decision(no retry/second mutation)", g2["state"] == "PARTIAL"
+                and g2["disagreement"]["outcome"] == "UNRESOLVED_USER_DECISION" and len(RV["calls"]) - nrv == 2
+                and [h[2] for h in g2["history"]].count("RUNNING") == 1)
+            # pre-execution implementation objection (executor) -> one round -> continue with intact authority
+            P("TXN-DG-0003", value={"dg": 3})
+            auth8("TXN-DG-0003")
+            ob = e8.apply_envelope(env("object", "TXN-DG-0003", role="executor", issue_code="TARGET_STALE", claim="fresh evidence",
+                                       evidence_status="FRESH_OBSERVATION"))
+            chk("DISAGREE implementation-objection->paused", ob.get("state") == "DISAGREEMENT"
+                and e8.apply_envelope(claim_env("TXN-DG-0003", "c", {"package_sha256": st8.get("TXN-DG-0003")["dispatch"]["package_sha256"],
+                                                                     "package": st8.get("TXN-DG-0003")["dispatch"]["package"]})).get("code") == "WRONG_STAGE")
+            chk("DISAGREE executor-cannot-answer-own-objection", e8.apply_envelope(env("respond", "TXN-DG-0003", role="executor",
+                                                                                       outcome="RESOLVED_NO_MATERIAL_CHANGE")).get("code") == "CAPABILITY_DENIED")
+            rs = e8.apply_envelope(env("respond", "TXN-DG-0003", role="designer", outcome="RESOLVED_NO_MATERIAL_CHANGE", claim="target fine",
+                                       evidence_status="FRESH_OBSERVATION"))
+            g3 = st8.get("TXN-DG-0003")
+            chk("DISAGREE resolved-no-material-change->continue(same authority)", rs.get("state") == "DISPATCHED"
+                and g3["authority"]["package_digest"] == g3["package_digest"])
+            # objection resolved by revised proposal -> authority invalidated; fresh Authorize required
+            P("TXN-DG-0004", value={"dg": 4})
+            auth8("TXN-DG-0004")
+            dg4 = st8.get("TXN-DG-0004")["package_digest"]
+            e8.apply_envelope(env("object", "TXN-DG-0004", role="executor", issue_code="SCOPE_TOO_WIDE", claim="narrow it", evidence_status="FRESH_OBSERVATION"))
+            rv4 = e8.apply_envelope(env("respond", "TXN-DG-0004", role="designer", outcome="RESOLVED_REVISED_PROPOSAL",
+                                        proposal=prop(value={"dg": 4, "narrow": True}), evidence_status="FRESH_OBSERVATION"))
+            g4 = st8.get("TXN-DG-0004")
+            chk("DISAGREE material-revision-invalidates-authority", rv4.get("state") == "AWAITING_AUTHORITY" and g4["authority"] is None
+                and g4["package_digest"] != dg4 and g4["revision"] == 2)
+            # unresolved -> one-round limit -> owner card; owner reject
+            P("TXN-DG-0005", value={"dg": 5})
+            auth8("TXN-DG-0005")
+            e8.apply_envelope(env("object", "TXN-DG-0005", role="executor", issue_code="UNSAFE", claim="unsafe", evidence_status="FRESH_OBSERVATION",
+                                  alternative=prop(value={"dg": 5, "alt": True})))
+            e8.apply_envelope(env("respond", "TXN-DG-0005", role="designer", outcome="UNRESOLVED", claim="disagree", evidence_status="FRESH_OBSERVATION"))
+            r2nd = e8.apply_envelope(env("respond", "TXN-DG-0005", role="designer", outcome="RESOLVED_NO_MATERIAL_CHANGE"))
+            chk("DISAGREE one-round-limit->owner-decision", r2nd.get("code") == "RECONCILIATION_BUDGET_EXHAUSTED"
+                and st8.get("TXN-DG-0005")["disagreement"]["outcome"] == "UNRESOLVED_USER_DECISION")
+            chk("DISAGREE owner-cannot-authorize-while-disputed", denied(lambda: auth8("TXN-DG-0005"), "MALFORMED"))
+            oa = auth8("TXN-DG-0005", decision="accept_alternative")
+            chk("DISAGREE owner-accepts-Claude-alternative->fresh-authority-required", oa.get("state") == "AWAITING_AUTHORITY"
+                and st8.get("TXN-DG-0005")["proposal"]["value"] == {"dg": 5, "alt": True} and st8.get("TXN-DG-0005")["authority"] is None)
+            P("TXN-DG-0006", value={"dg": 6})
+            e8.apply_envelope(env("object", "TXN-DG-0006", role="designer", issue_code="RISK", claim="risky", evidence_status="FRESH_OBSERVATION"))
+            chk("DISAGREE design-objection->owner-reject->CANCELLED", auth8("TXN-DG-0006", decision="reject").get("state") == "CANCELLED")
+            # live-style design check (mock reviewer route) on a mock txn: objection then owner reconsider -> recheck
+            RV["q"] = [("DISAGREE_DESIGN", "FRESH_OBSERVATION"), ("NO_OBJECTION", "FRESH_OBSERVATION")]
+            P("TXN-DG-0007", value={"dg": 7})
+            r7 = st8.get("TXN-DG-0007")
+            r7["proposal"]["review_route"] = "openai-api"            # exercise the designer reconsider path via adapter
+            st8.put(r7, r7["state_version"])
+            e8.adapters["openai-api"] = mock_reviewer
+            e8.design_check("TXN-DG-0007")
+            chk("DISAGREE design-check-objection->DISAGREEMENT", st8.get("TXN-DG-0007")["state"] == "DISAGREEMENT")
+            ok7 = auth8("TXN-DG-0007", decision="reconsider")
+            chk("DISAGREE ask-reconsider-once->recheck->AWAITING_AUTHORITY", ok7.get("state") == "AWAITING_AUTHORITY"
+                and st8.get("TXN-DG-0007")["design_review"]["verdict"] == "NO_OBJECTION")
+            e8.adapters.pop("openai-api")
+
+            # ---------- anti-assumption / shortcut fail-closed ----------
+            chk("ASSUME critical-inference-cannot-become-executable", P("TXN-AA-0001", facts=[{"k": "target_exists", "v": True,
+                "status": "INFERENCE", "critical": True}]).get("code") == "CRITICAL_FACT_UNVERIFIED")
+            chk("ASSUME provider-asserted-authority-rejected", P("TXN-AA-0002", facts=[{"k": "owner_ok", "v": True, "status": "AUTHORITY"}]).get("code")
+                == "PROVIDER_AUTHORITY_CLAIM")
+            chk("ASSUME classified-facts-accepted", P("TXN-AA-0003", value={"aa": 3}, facts=[{"k": "t", "v": 1, "status": "FRESH_OBSERVATION",
+                "critical": True}]).get("state") == "AWAITING_AUTHORITY")
+            RV["q"] = [("ACCEPT", "INFERENCE")]
+            ca, _ = pull_run("TXN-AA-0004", value={"aa": 4})
+            submit("TXN-AA-0004", ca)
+            chk("ASSUME review-acceptance-on-inference->PARTIAL", st8.get("TXN-AA-0004")["state"] == "PARTIAL"
+                and st8.get("TXN-AA-0004")["review"]["status"] == "ANTI_ASSUMPTION_REJECTED")
+            cs, _ = pull_run("TXN-AA-0005", value={"aa": 5})
+            shortcut = {"echo": {"aa": 5}, "txn_id": "TXN-AA-0005", "proposal_sha256": "desired-state-observed"}
+            o5 = submit("TXN-AA-0005", cs, shortcut)
+            chk("ASSUME desired-state-alone-does-not-prove-causation->STOP", o5.get("state") == "STOP"
+                and st8.get("TXN-AA-0005")["verification"]["predicates"]["bound_proposal"] is False)
+            P("TXN-AA-0006", value={"aa": 6})
+            chk("ASSUME objection-claiming-authority-rejected", e8.apply_envelope(env("object", "TXN-AA-0006", role="designer", issue_code="X",
+                claim="I approve", evidence_status="AUTHORITY")).get("code") == "PROVIDER_AUTHORITY_CLAIM")
+            chk("ASSUME no-credential-in-v08-records", KEY_A not in json.dumps([st8.get(t) for t in ("TXN-RV-0001", "TXN-R1-0010")]))
             LOG_SINK = None
 
             # --- unsupported newer store schema fails closed ---

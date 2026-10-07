@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.0 (DAI-IN-509 production build; synthetic operations only)
+- R1: exact executable package `gaop.exec_package.v1` + SHA-256 `package_digest`; owner authority binds the
+  digest; every consequential step re-verifies it; post-authority change → STOP.
+- R2: deterministic `operation_id` registry; one-time authority (`authority_use`); duplicate `envelope_id`
+  rejection; replay after completion returns the existing receipt; verified (read-back) checkpoints; boot
+  resume only from verified non-consequential checkpoints.
+- R3: explicit envelope `role`; role × op × stage capability policy enforced inside every op; provider-role
+  binding (claude = executor, openai = designer/reviewer); target/operation/digest-bound claims.
+- Dual-AI: ChatGPT design check, post-execution independent review (`REVIEWING`), `DISAGREEMENT` state with
+  one bounded reconciliation round and owner card; `PARTIAL` terminal state.
+- Budgets `gaop.budget.v1` with policy ceilings; heartbeat every 5 s (`live.json`, `/api/live/<TXN>`),
+  stage timeouts and watchdog, ETA only from observed data; panel auto-refresh while active.
+- Anti-assumption fact classification; receipt `gaop.receipt.v3`. Selftest 149 checks.
+- Behaviour change: `openai-api` can no longer be an executor route; envelopes require `role`; claims require
+  `package_digest`, `operation`, `target`. Store schema unchanged (1).
+
 ## 0.7.2
 - Live provider adapters (App is the executor for API routes): `claude-api` (Anthropic Messages API)
   and `openai-api` (OpenAI Chat Completions). After the owner's single Authorize press the App claims,
