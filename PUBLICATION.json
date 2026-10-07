@@ -1,14 +1,14 @@
 {
- "gaop_version": "0.8.0",
- "package_digest": "35cf495c962e042909e6ecdce606e1990abea47ab1d80ecb3554f74ccc0e6690",
+ "gaop_version": "0.8.1",
+ "package_digest": "74f4dfd0645479380ae2090e5682760157546e9e27fa7570fae2279079fcd3e6",
  "previous_release": {
-  "gaop_version": "0.7.2",
-  "private_source_commit": "4648efff446b28798ac7d58ee4e4fd698d3168ce",
-  "public_main": "fc9940ee1256187ad0d5c513f98857fe04b5b136"
+  "gaop_version": "0.8.0",
+  "private_source_commit": "9f1886e321459233754d076c5806b197a7f142c3",
+  "public_main": "696ae3028f05be5530e498eaf94498f9dbc3711f"
  },
- "private_source_commit": "9f1886e321459233754d076c5806b197a7f142c3",
+ "private_source_commit": "0b446d8d380ef73f19c2ac83f419d5be3df17157",
  "public_distribution_commit": "recorded after merge (see git history / DAI-OUT-509)",
  "release_manifest": "gaop/GAOP_RELEASE.json",
- "rollback_target": "public commit fc9940ee1256187ad0d5c513f98857fe04b5b136 (GAOP 0.7.2)",
+ "rollback_target": "public commit 696ae3028f05be5530e498eaf94498f9dbc3711f (GAOP 0.8.0); 0.7.2 = fc9940ee1256187ad0d5c513f98857fe04b5b136",
  "schema": "gaop.publication.v1"
 }

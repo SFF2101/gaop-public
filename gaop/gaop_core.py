@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAOP v0.8.0 — production dual-AI build (DAI-IN-509): control plane core.
+"""GAOP v0.8.1 — production dual-AI build (DAI-IN-509): control plane core.
 
 Single stdlib-only module. Roles (repository-role invariant):
   GitHub private repo = source; gaop-public = generated secret-free distribution;
@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -88,7 +88,7 @@ VERIFY_PREDICATES = {"echo_equals_value", "bound_txn", "bound_proposal", "bound_
 # ---- per-transaction budgets (gaop.budget.v1): defaults, and policy ceilings a proposal may not exceed
 BUDGET_KEYS = ("elapsed_s", "provider_calls", "tool_calls", "retrieval_bytes", "input_tokens",
                "output_tokens", "retries", "reconciliation_rounds", "stages")
-BUDGET_DEFAULT = {"elapsed_s": 900, "provider_calls": 4, "tool_calls": 30, "retrieval_bytes": 65536,
+BUDGET_DEFAULT = {"elapsed_s": 900, "provider_calls": 5, "tool_calls": 30, "retrieval_bytes": 65536,
                   "input_tokens": 8000, "output_tokens": 1500, "retries": 0, "reconciliation_rounds": 1,
                   "stages": 30}
 BUDGET_MAX = {"elapsed_s": 3600, "provider_calls": 6, "tool_calls": 60, "retrieval_bytes": 262144,
@@ -612,7 +612,9 @@ def extract_json(text, need):
 def review_prompt(kind, payload):
     """Compact machine instruction for the OpenAI Designer/Reviewer. kind: design | verify."""
     if kind == "design":
-        ask = ('Problem-check this proposed bounded transaction before owner authorization. Return '
+        ask = ('Problem-check this proposed bounded transaction before owner authorization. Judge it against its own '
+               'stated scope, stated_effect and summary: object only to a concrete target, scope, safety, feasibility '
+               'or evidence problem within that stated purpose, not to goals the transaction does not claim. Return '
                '{"verdict":"NO_OBJECTION"|"DISAGREE_DESIGN","issue_code":"<UPPER_SNAKE or NONE>",'
                '"claim":"<=200 chars","evidence_status":"FRESH_OBSERVATION"|"INFERENCE"|"UNKNOWN",'
                '"txn_id":<copy>,"package_digest":<copy>,"correlation_id":<copy>}.')
@@ -1293,7 +1295,9 @@ class Engine:
         payload = {"kind": kind, "txn_id": rec["txn_id"], "package_digest": rec["package_digest"],
                    "correlation_id": corr, "operation": rec["exec_package"]["operation"],
                    "targets": rec["exec_package"]["targets"], "parameters": rec["exec_package"]["parameters"],
-                   "scope": rec["exec_package"]["scope"], "verification_predicates": rec["exec_package"]["verification"]}
+                   "scope": rec["exec_package"]["scope"], "verification_predicates": rec["exec_package"]["verification"],
+                   "stated_effect": rec["exec_package"]["constraints"]["effect"], "summary": rec["proposal"]["summary"],
+                   "operation_class": "synthetic-allowlisted" if rec["exec_package"]["operation"] in ALLOWED_OPS else "unknown"}
         if kind == "verify":
             payload.update(result=rec["result"]["result"], result_sha256=rec["result"]["result_sha256"],
                            deterministic_verification=rec["verification"],
@@ -1535,6 +1539,9 @@ class Engine:
                   "status": bad or "RECEIVED", "at": self.clock(),
                   **{k: meta.get(k) for k in ("route", "model", "response_id", "request_id", "correlation_id")}}
             rec["design_review"] = dr
+            if not bad and o.get("verdict") == "NO_OBJECTION" and rec.get("prior_disagreements"):
+                rec["prior_disagreements"][-1]["outcome"] = "RESOLVED_NO_MATERIAL_CHANGE"
+                rec["prior_disagreements"][-1]["resolved_at"] = self.clock()
             if not bad and o.get("verdict") == "DISAGREE_DESIGN":
                 claim = self._claim_obj({"issue_code": o.get("issue_code"), "claim": o.get("claim"),
                                          "evidence_status": o.get("evidence_status") if o.get("evidence_status") in FACT_STATUS else "UNKNOWN"},
@@ -1582,6 +1589,8 @@ class Engine:
                 "review_request_id": rv.get("request_id"), "review_correlation_id": rv.get("correlation_id"),
                 "design_verdict": (rec.get("design_review") or {}).get("verdict"),
                 "disagreement_kind": dg.get("kind"), "disagreement_outcome": dg.get("outcome"),
+                "prior_disagreements": [[x.get("kind"), x.get("issue_code"), x.get("outcome")]
+                                        for x in rec.get("prior_disagreements", [])],
                 "budget_used": (rec.get("budget") or {}).get("used"),
                 "last_checkpoint_state_version": (rec.get("last_checkpoint") or {}).get("state_version"),
                 "reconcile_resolution": (rec.get("reconcile") or {}).get("resolution"),
@@ -1674,6 +1683,7 @@ class Engine:
             if d["kind"] == "DISAGREE_DESIGN" and rec["proposal"].get("review_route") == "openai-api":
                 # ask the designer to reconsider once (counted round); proposal itself unchanged
                 d["rounds_used"] += 1
+                d["outcome"] = "RECONSIDER_REQUESTED"
                 self._charge(rec, "reconciliation_rounds")
                 rec["pending_nonce"] = secrets.token_hex(16)
                 rec["design_review"] = None
@@ -1870,6 +1880,7 @@ class Engine:
         v["evidence_status"] = (rec.get("evidence") or {}).get("status")
         v["receipt_sha256"] = (rec.get("receipt") or {}).get("receipt_sha256")
         v["disagreement"] = rec.get("disagreement")
+        v["prior_disagreements"] = rec.get("prior_disagreements") or []
         v["live"] = self.live_view(rec) if "budget" in rec else None
         if owner and rec["state"] in ("AWAITING_AUTHORITY", "DISAGREEMENT"):
             v["pending_nonce"] = rec["pending_nonce"]
@@ -2436,7 +2447,7 @@ class Handler(BaseHTTPRequestHandler):
         busy = any((e.s.get(t) or {}).get("state") not in (None, "AWAITING_AUTHORITY", "DISAGREEMENT", "DISPATCHED", "UNKNOWN_RECONCILE")
                    for t in e.s.active())
         hb = e.s.live_get().get("heartbeat_at")
-        refresh = "<meta http-equiv='refresh' content='%d'>" % HEARTBEAT_SECONDS if busy else ""
+        refresh = ("<meta http-equiv='refresh' content='%d;url=%s/'>" % (HEARTBEAT_SECONDS, base)) if busy else ""
         return ("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' "
                 "content='width=device-width,initial-scale=1'>" + refresh + "<title>GAOP</title><style>"
                 "body{font-family:system-ui,sans-serif;margin:16px;background:#fafafa;color:#222}"
@@ -3270,6 +3281,23 @@ def run_selftest():
             ok7 = auth8("TXN-DG-0007", decision="reconsider")
             chk("DISAGREE ask-reconsider-once->recheck->AWAITING_AUTHORITY", ok7.get("state") == "AWAITING_AUTHORITY"
                 and st8.get("TXN-DG-0007")["design_review"]["verdict"] == "NO_OBJECTION")
+            chk("DISAGREE resolved-design-disagreement-recorded(view+receipt)",
+                st8.get("TXN-DG-0007")["prior_disagreements"][-1]["outcome"] == "RESOLVED_NO_MATERIAL_CHANGE"
+                and e8.view("TXN-DG-0007")["prior_disagreements"][0]["kind"] == "DISAGREE_DESIGN"
+                and Engine.make_receipt(st8.get("TXN-DG-0007"), "X")["prior_disagreements"] == [["DISAGREE_DESIGN", "TEST_ISSUE", "RESOLVED_NO_MATERIAL_CHANGE"]])
+            seen_pl = {}
+            RV["q"] = [lambda k, p: (seen_pl.update(p), {"verdict": "NO_OBJECTION", "issue_code": "NONE", "claim": "x",
+                       "evidence_status": "FRESH_OBSERVATION", "txn_id": p["txn_id"], "package_digest": p["package_digest"],
+                       "correlation_id": p["correlation_id"]})[1]]
+            P("TXN-DG-0008", value={"dg": 8})
+            r8b = st8.get("TXN-DG-0008")
+            r8b["proposal"]["review_route"] = "openai-api"
+            st8.put(r8b, r8b["state_version"])
+            e8.adapters["openai-api"] = mock_reviewer
+            e8.design_check("TXN-DG-0008")
+            chk("REVIEW design-payload-carries-stated-purpose", seen_pl.get("stated_effect") == "echo a synthetic value"
+                and seen_pl.get("summary") == "selftest" and seen_pl.get("operation_class") == "synthetic-allowlisted"
+                and "stated purpose" in review_prompt("design", {}))
             e8.adapters.pop("openai-api")
 
             # ---------- anti-assumption / shortcut fail-closed ----------
