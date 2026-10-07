@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.3 (DAI-IN-512 P1 diagnostic)
+- HA failure detail (method/path/HTTP status; no data) logged and shown in the transaction view (`ha`).
+- Startup boundary log adds a Core API root probe status and whether the Supervisor token is present (never its value).
+
 ## 0.8.2 (DAI-IN-512 P1 — bounded real-HA Pilot targets)
 - Exactly two real Home Assistant operations, each bound to exactly one entity: `ha.state.read` on `sun.sun`
   (read-only) and `ha.input_boolean.set` on `input_boolean.gaop_pilot_probe` (`{state: on|off}`). No generic
