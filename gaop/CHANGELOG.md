@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.4 (DAI-IN-512 P1 fix)
+- Fix: under s6-overlay the `/bin/sh` entrypoint does not inherit the container environment, so the Supervisor
+  token was absent (0.8.2/0.8.3 HA calls were unauthenticated → HTTP 401, failing closed). GAOP now reads the
+  token from `/run/s6/container_environment/SUPERVISOR_TOKEN` when not in the process environment. Never logged.
+
 ## 0.8.3 (DAI-IN-512 P1 diagnostic)
 - HA failure detail (method/path/HTTP status; no data) logged and shown in the transaction view (`ha`).
 - Startup boundary log adds a Core API root probe status and whether the Supervisor token is present (never its value).
