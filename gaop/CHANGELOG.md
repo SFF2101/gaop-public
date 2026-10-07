@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.5 (DAI-IN-513 reviewer hardening)
+- OpenAI Designer/Reviewer model pinned in code: `OPENAI_REVIEW_MODEL = "gpt-4.1"` (was the model stored with the
+  owner's key, `gpt-4o-mini`). Applies to design and verification review calls only; the stored key and its model
+  field are not changed. Setup card shows the pinned design/review model.
+- For `ha.state.read` / `ha.input_boolean.set` the review payload carries `enforced_capability_facts` (derived from
+  `HA_OP_TARGETS` and `HAClient.CALLS`), and the prompt tells the reviewer to evaluate the bounded package plus these
+  code-enforced facts, not hypothetical generic Home Assistant capabilities, while still objecting to any concrete
+  package problem. Synthetic-operation prompts are unchanged.
+- No change to disagreement handling, R1/R2/R3, authority binding, budgets, predicates, allowlists, routes or
+  permissions. Selftest 179 checks.
+
 ## 0.8.4 (DAI-IN-512 P1 fix)
 - Fix: under s6-overlay the `/bin/sh` entrypoint does not inherit the container environment, so the Supervisor
   token was absent (0.8.2/0.8.3 HA calls were unauthenticated → HTTP 401, failing closed). GAOP now reads the
