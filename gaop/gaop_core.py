@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAOP v0.8.6 — production dual-AI build (+ DAI-IN-515 Dashboard budget profiles) (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
+"""GAOP v0.8.7 — production dual-AI build (+ DAI-IN-515 Dashboard budget profiles, DAI-IN-518 HA-path metering) (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
 
 Single stdlib-only module. Roles (repository-role invariant):
   GitHub private repo = source; gaop-public = generated secret-free distribution;
@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time, types
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.6"
+VERSION = "0.8.7"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -657,6 +657,14 @@ def ha_http(method, path, body, timeout):
         raise HAError("UNCERTAIN", type(ex).__name__)
 
 
+class HABudgetExhausted(HAError):
+    """DAI-IN-518: the transaction budget (tool_calls / retrieval_bytes / any) is exhausted before the next HA
+    call; raised before any network I/O for that call."""
+    def __init__(self, key):
+        super().__init__("DEFINITIVE", "BUDGET_EXHAUSTED " + key)
+        self.key = key
+
+
 class HAClient:
     """The ONLY Home Assistant access in GAOP: a fixed table of exactly three calls. Anything else is
     refused before any network I/O. calls[] records every request for the ha_no_write/ha_single_write
@@ -671,14 +679,20 @@ class HAClient:
     def __init__(self, transport=None):
         self.t = transport or ha_http
         self.calls = []
+        self.meter = None          # DAI-IN-518: per-transaction budget meter (set by Engine._ha_execute)
 
     def _req(self, method, path, body=None):
         if (method, path) not in self.CALLS:
             raise Denied("HA_CALL_NOT_ALLOWLISTED", "%s %s" % (method, path))
         if method == "POST" and body != {"entity_id": "input_boolean.gaop_pilot_probe"}:
             raise Denied("HA_CALL_NOT_ALLOWLISTED", "service body")
+        if self.meter:
+            self.meter.before_call()           # may raise HABudgetExhausted: no network I/O for this call
         self.calls.append([method, path])
-        return self.t(method, path, body, HA_TIMEOUT)
+        st, raw = self.t(method, path, body, HA_TIMEOUT)
+        if self.meter:
+            self.meter.after_call(len(raw or b""))  # exact raw response-body bytes read by the transport
+        return st, raw
 
     def get_state(self, entity_id):
         st, raw = self._req("GET", "/states/" + entity_id)
@@ -838,6 +852,31 @@ def adapter_for(route, store):
 
 
 # ============================== engine ==============================
+class _HAMeter:
+    """DAI-IN-518: charges the transaction budget for GAOP's own HA Core requests on the API-executed path
+    (Engine._ha_execute). One attempted request = one tool_call; retrieval_bytes = exact raw response-body
+    bytes read. Exhaustion from earlier calls, or a call that would exceed tool_calls, is refused before the
+    next request. These requests are not charged anywhere else (envelope ops / package fetch are separate
+    routes), so there is no double charge."""
+    def __init__(self, engine, rec):
+        self.e, self.rec = engine, rec
+
+    def before_call(self):
+        b = self.rec.get("budget")
+        if not b:
+            return
+        k = self.e._exhausted(self.rec)
+        if k is None and b["used"].get("tool_calls", 0) + 1 > b["limits"]["tool_calls"]:
+            k = "tool_calls"
+        if k:
+            raise HABudgetExhausted(k)
+        self.e._charge(self.rec, "tool_calls")
+
+    def after_call(self, nbytes):
+        if self.rec.get("budget"):
+            self.e._charge(self.rec, "retrieval_bytes", nbytes)
+
+
 class Engine:
     """v0.8.0 production engine. R1 exact package/authority binding, R2 operation identity /
     one-time authority / verified checkpoints, R3 role x op x stage capability scoping, budgets,
@@ -1440,6 +1479,7 @@ class Engine:
             return {"state": "STOP", "provider": "INTENT_MISMATCH"}
         ha = self.adapters.get("ha_client") or HAClient()
         ha.calls = []
+        ha.meter = _HAMeter(self, rec)
         ent = expected["entity_id"]
         res = {"txn_id": txn_id, "proposal_sha256": rec["proposal_sha256"], "entity_id": ent,
                "operation": pkg["operation"]}
@@ -1452,6 +1492,8 @@ class Engine:
                 ha.set_boolean(expected["desired"])
                 res["after"] = ha.get_state(ent)
         except HAError as he:
+            if isinstance(he, HABudgetExhausted):
+                rec["budget"]["exhausted"] = he.key
             rec["ha"] = {"calls": list(ha.calls), "error": he.kind, "detail": he.detail}
             log("HA %s %s %s calls=%s" % (txn_id, he.kind, he.detail, json.dumps(ha.calls)))
             wrote = any(c[0] == "POST" for c in ha.calls)
@@ -1464,6 +1506,8 @@ class Engine:
                          "HA %s: %s" % (he.kind, he.detail))
             self.s.put(rec, v)
             return {"state": rec["state"], "ha": he.kind}
+        finally:
+            ha.meter = None
         res["ha_calls"] = list(ha.calls)
         rb = canon(res)
         rec["result"] = {"result": res, "result_sha256": sha(rb), "persisted_at": self.clock(),
@@ -3981,6 +4025,115 @@ def run_selftest():
                 budget_profile_name(PB) == "pilot_bounded" and budget_profile_name(BUDGET_DEFAULT) == "standard"
                 and budget_profile_name({"elapsed_s": 1}) == "custom" and "elapsed_s 600" in budget_text(PB)
                 and "stages 25" in budget_text(PB))
+
+            # ================= v0.8.7 HA-path budget metering (DAI-IN-518) =================
+            stC = Store(os.path.join(td, "gaop87"))
+            save_provider_cred(stC, "claude-api", KEY_A, "")
+            save_provider_cred(stC, "openai-api", KEY_O, "test-model")
+            hcC = HAClient(fha)
+            eC = Engine(stC, adapters={"mock-reviewer": mock_reviewer, "ha_client": hcC}, clock=clk, transport=mk_review())
+
+            def gbytes(ent):            # exact raw body the deterministic HA fixture returns for GET /states/<ent>
+                return len(json.dumps({"entity_id": ent, "state": HS[ent], "last_changed": "t"}).encode())
+
+            def authC(txn):
+                v = eC.view(txn, owner=True)
+                return eC.owner_decision(peer=INGRESS_GATEWAY, remote_user_id=OWNER, txn_id=txn,
+                                         proposal_sha256=v["proposal_sha256"], state_version=v["state_version"],
+                                         nonce=v.get("pending_nonce") or "", decision="authorize")
+
+            def PC(txn, op, value=None, **bud):
+                return eC.apply_envelope(env("propose", txn, proposal=prop(
+                    op=op, target=HA_OP_TARGETS[op], route="claude-api",
+                    value={} if value is None else value, **({"budgets": bud} if bud else {}))))
+            clk.t += 2
+            HMODE.update(post=200, get=200, post_raise=False)
+            rr = eC.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="read_sun")
+            TR = rr["txn_id"]
+            authC(TR)
+            n0, rb_sun = len(HCALLS), gbytes("sun.sun")
+            eC.api_execute(TR, transport=mk("anthropic"))
+            r = stC.get(TR)
+            u, rc = r["budget"]["used"], r.get("receipt") or {}
+            chk("HAM 1 real-path HA GET charges tool_calls += 1 (Dashboard read)",
+                r["state"] == "COMPLETED" and HCALLS[n0:] == [("GET", "/states/sun.sun")] and u["tool_calls"] == 1)
+            chk("HAM 2 retrieval_bytes == exact raw fixture response-body length", u["retrieval_bytes"] == rb_sun > 0)
+            chk("HAM 7 no double charge: tool_calls == HA calls in receipt; envelope charging not involved",
+                u["tool_calls"] == len(rc.get("ha_calls") or []) == 1)
+            chk("HAM 8 provider/token/stage/retry/reconciliation semantics unchanged",
+                u["provider_calls"] == 3 and u["retries"] == 0 and u["reconciliation_rounds"] == 0 and u["stages"] == 10
+                and u["input_tokens"] > 0 and u["output_tokens"] > 0)
+            chk("HAM 9 receipt budget_limits + budget_used reflect exact metered values",
+                rc.get("budget_limits") == resolve_budget_profile("pilot_bounded") and rc.get("budget_used") == u
+                and rc["receipt_sha256"] == sha(canon({k: x for k, x in rc.items() if k != "receipt_sha256"})))
+            # consequential set: 3 fixed-table calls accumulate exactly
+            pre = HS["input_boolean.gaop_pilot_probe"]
+            want = "off" if pre == "on" else "on"
+            clk.t += 2
+            rs3 = eC.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="probe_" + want)
+            TS = rs3["txn_id"]
+            authC(TS)
+            n0, b1 = len(HCALLS), gbytes("input_boolean.gaop_pilot_probe")
+            eC.api_execute(TS, transport=mk("anthropic"))
+            r = stC.get(TS)
+            b3 = gbytes("input_boolean.gaop_pilot_probe")
+            chk("HAM 3 multiple fixed-table HA calls accumulate both counters exactly (GET+POST+GET)",
+                r["state"] == "COMPLETED" and len(HCALLS) - n0 == 3 and r["budget"]["used"]["tool_calls"] == 3
+                and r["budget"]["used"]["retrieval_bytes"] == b1 + len(b"[]") + b3 and HS["input_boolean.gaop_pilot_probe"] == want)
+            # lower tool_calls limit: exhaustion prevents any next HA call
+            PC("TXN-HM-0001", "ha.state.read", tool_calls=0)
+            authC("TXN-HM-0001")
+            n0 = len(HCALLS)
+            eC.api_execute("TXN-HM-0001", transport=mk("anthropic"))
+            r = stC.get("TXN-HM-0001")
+            chk("HAM 4a read with tool_calls=0 -> STOP before any HA call",
+                r["state"] == "STOP" and len(HCALLS) == n0 and r["budget"]["exhausted"] == "tool_calls" and r["result"] is None)
+            pre = HS["input_boolean.gaop_pilot_probe"]
+            want = "off" if pre == "on" else "on"
+            PC("TXN-HM-0002", "ha.input_boolean.set", {"state": want}, tool_calls=1)
+            authC("TXN-HM-0002")
+            n0 = len(HCALLS)
+            eC.api_execute("TXN-HM-0002", transport=mk("anthropic"))
+            r = stC.get("TXN-HM-0002")
+            chk("HAM 4b set with tool_calls=1 -> pre-read only, write refused, STOP, no write",
+                r["state"] == "STOP" and HCALLS[n0:] == [("GET", "/states/input_boolean.gaop_pilot_probe")]
+                and HS["input_boolean.gaop_pilot_probe"] == pre and r["budget"]["used"]["tool_calls"] == 1
+                and r["budget"]["exhausted"] == "tool_calls" and r["execution"]["maybe_write"] is False)
+            PC("TXN-HM-0003", "ha.input_boolean.set", {"state": want}, retrieval_bytes=10)
+            authC("TXN-HM-0003")
+            n0 = len(HCALLS)
+            eC.api_execute("TXN-HM-0003", transport=mk("anthropic"))
+            r = stC.get("TXN-HM-0003")
+            chk("HAM 5 retrieval_bytes crossing detected -> fail closed before next HA call (no write)",
+                r["state"] == "STOP" and HCALLS[n0:] == [("GET", "/states/input_boolean.gaop_pilot_probe")]
+                and HS["input_boolean.gaop_pilot_probe"] == pre and r["budget"]["exhausted"] == "retrieval_bytes"
+                and r["budget"]["used"]["retrieval_bytes"] > 10)
+            PC("TXN-HM-0004", "ha.input_boolean.set", {"state": want}, tool_calls=2)
+            authC("TXN-HM-0004")
+            n0 = len(HCALLS)
+            eC.api_execute("TXN-HM-0004", transport=mk("anthropic"))
+            r = stC.get("TXN-HM-0004")
+            again = denied(lambda: eC.api_execute("TXN-HM-0004", transport=mk("anthropic")))
+            chk("HAM 6 exhaustion after a write -> UNKNOWN_RECONCILE, no post-read, no retry, no rollback",
+                r["state"] == "UNKNOWN_RECONCILE" and HCALLS[n0:] == [("GET", "/states/input_boolean.gaop_pilot_probe"),
+                                                                     ("POST", "/services/input_boolean/turn_" + want)]
+                and r["execution"]["maybe_write"] is True and r["budget"]["exhausted"] == "tool_calls"
+                and again and len(HCALLS) == n0 + 2)
+            PC("TXN-HM-0005", "ha.state.read", retrieval_bytes=10)
+            authC("TXN-HM-0005")
+            n0 = len(HCALLS)
+            eC.api_execute("TXN-HM-0005", transport=mk("anthropic"))
+            r = stC.get("TXN-HM-0005")
+            chk("HAM 5b read whose only response crosses retrieval_bytes: exactly one call, never COMPLETED",
+                len(HCALLS) == n0 + 1 and r["state"] in ("PARTIAL", "STOP", "UNKNOWN_RECONCILE")
+                and r["budget"]["used"]["retrieval_bytes"] == gbytes("sun.sun"))
+            chk("HAM 13 meter detached after execution; fixed HA call table/targets unchanged",
+                hcC.meter is None and HAClient.CALLS == {("GET", "/states/sun.sun"), ("GET", "/states/input_boolean.gaop_pilot_probe"),
+                                                        ("POST", "/services/input_boolean/turn_on"), ("POST", "/services/input_boolean/turn_off")}
+                and HA_OP_TARGETS == {"ha.state.read": "ha:sun.sun", "ha.input_boolean.set": "ha:input_boolean.gaop_pilot_probe"}
+                and OPENAI_REVIEW_MODEL == "gpt-4.1")
+            chk("HAM 13b HAClient without meter behaves as before (no budget side effects)",
+                HAClient(fha).get_state("sun.sun")["entity_id"] == "sun.sun")
 
             # --- unsupported newer store schema fails closed ---
             m = os.path.join(td, "gaop", "meta.json")
