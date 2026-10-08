@@ -1,5 +1,8 @@
 # GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
 
+**v0.8.7:** every Home Assistant request GAOP makes for a transaction counts as one `tool_call`, and its
+response bytes count toward `retrieval_bytes`; both limits are enforced before the next request.
+
 **v0.8.6:** Dashboard requests carry transaction-scoped budgets from an allowlisted profile (`standard` =
 the defaults; `pilot_bounded` for the Pilot buttons). The limits are shown on the transaction card before
 Authorize, bound into the package digest, enforced, and recorded in the receipt (`budget_limits`, `budget_used`).

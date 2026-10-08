@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.7 (DAI-IN-518 HA-path budget metering — production defect fix)
+- Fix: on the Dashboard/claude-api Home Assistant path (`Engine._ha_execute` → `HAClient`), GAOP's own HA Core requests
+  were not charged to `tool_calls` or `retrieval_bytes`, so those two bound limits were inert there. Each attempted HA
+  request now charges exactly one `tool_call`, and `retrieval_bytes` is charged with the exact raw response-body bytes
+  read by the transport. Exhaustion (or a call that would exceed `tool_calls`) is refused before the next HA request:
+  no write yet → STOP; after a write → UNKNOWN_RECONCILE (no retry, no rollback). A crossing on the final response is
+  caught by the existing post-result budget path (PARTIAL).
+- No double charge: envelope ops and `/api/pkg` keep their existing charging; the API HA path uses neither.
+- Unchanged: budget defaults/ceilings/profiles, HA call table and targets, R1/R2/R3, roles, gpt-4.1 pin and prompt,
+  permissions, store schema, protocol. Selftest 207 checks (194 prior unchanged + 13 new).
+
 ## 0.8.6 (DAI-IN-515 Dashboard transaction-scoped budgets — production defect fix)
 - Fix: the Dashboard request entries (`owner_request`, `owner_pilot_request`) built proposals without `budgets`, so every
   Dashboard transaction silently ran at `BUDGET_DEFAULT`. They now resolve an owner-selectable, server-side allowlisted
