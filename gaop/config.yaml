@@ -1,5 +1,5 @@
 name: "Governed AI Operations Platform (GAOP)"
-version: "0.8.5"
+version: "0.8.6"
 slug: gaop
 description: "GAOP durable production generation: Dashboard-authorised, fail-closed transaction control plane (dual-AI production build v0.8.x; synthetic operations plus two exact allowlisted P1 Home Assistant targets). App-private /data only; least privilege; no secrets in distribution."
 url: "https://github.com/SFF2101/gaop-public"

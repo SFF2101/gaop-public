@@ -1,5 +1,9 @@
 # GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
 
+**v0.8.6:** Dashboard requests carry transaction-scoped budgets from an allowlisted profile (`standard` =
+the defaults; `pilot_bounded` for the Pilot buttons). The limits are shown on the transaction card before
+Authorize, bound into the package digest, enforced, and recorded in the receipt (`budget_limits`, `budget_used`).
+
 **v0.8.5:** the OpenAI design/review model is pinned in code (`gpt-4.1`), and real-HA reviews receive the
 code-enforced capability facts (§16 of the as-built document).
 
