@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.6 (DAI-IN-515 Dashboard transaction-scoped budgets — production defect fix)
+- Fix: the Dashboard request entries (`owner_request`, `owner_pilot_request`) built proposals without `budgets`, so every
+  Dashboard transaction silently ran at `BUDGET_DEFAULT`. They now resolve an owner-selectable, server-side allowlisted
+  budget profile (`standard` = exactly `BUDGET_DEFAULT`; `pilot_bounded` = 600 s / 5 / 20 / 32768 B / 8000 / 1500 / 0 / 1 /
+  25 stages) into the proposal, so the limits are in the exec package / `package_digest`, bound by Authorize and
+  enforced by the existing engine. Unknown profile → `MALFORMED` (fail closed). Pilot buttons always use
+  `pilot_bounded` (any other selection is denied; never falls back to `standard`).
+- Dashboard: synthetic request has a budget-profile selector (default `standard`); the Pilot card shows
+  `pilot_bounded`; each active transaction card shows the bound budget limits before Authorize. Transaction view adds
+  `package_budgets`.
+- Receipt adds `budget_limits` beside the existing `budget_used`.
+- Unchanged: `BUDGET_DEFAULT`, `BUDGET_MAX`, R1/R2/R3, roles, gpt-4.1 pin and reviewer prompt, allowlists, permissions,
+  store schema, protocol. Selftest 194 checks (179 prior unchanged + 15 new).
+
 ## 0.8.5 (DAI-IN-513 reviewer hardening)
 - OpenAI Designer/Reviewer model pinned in code: `OPENAI_REVIEW_MODEL = "gpt-4.1"` (was the model stored with the
   owner's key, `gpt-4o-mini`). Applies to design and verification review calls only; the stored key and its model

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAOP v0.8.5 — production dual-AI build (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
+"""GAOP v0.8.6 — production dual-AI build (+ DAI-IN-515 Dashboard budget profiles) (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
 
 Single stdlib-only module. Roles (repository-role invariant):
   GitHub private repo = source; gaop-public = generated secret-free distribution;
@@ -19,11 +19,11 @@ Planes and who may write them:
 Modes (App option `mode`): idle (default: serve panel + process envelopes; NO harness replay),
 selftest (deterministic Phase-E matrix, then idle).
 """
-import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time
+import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time, types
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.5"
+VERSION = "0.8.6"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -106,6 +106,17 @@ BUDGET_DEFAULT = {"elapsed_s": 900, "provider_calls": 5, "tool_calls": 30, "retr
 BUDGET_MAX = {"elapsed_s": 3600, "provider_calls": 6, "tool_calls": 60, "retrieval_bytes": 262144,
               "input_tokens": 20000, "output_tokens": 4000, "retries": 1, "reconciliation_rounds": 1,
               "stages": 40}
+# DAI-IN-515: owner-selectable Dashboard budget profiles (server-side allowlist). A profile resolves every
+# gaop.budget.v1 key before proposal creation; the resolved dict goes into proposal["budgets"], hence into the
+# exec package / package_digest bound by Authorize, and is enforced by the existing engine.
+DASHBOARD_BUDGET_PROFILES = types.MappingProxyType({
+    "standard": types.MappingProxyType(dict(BUDGET_DEFAULT)),
+    "pilot_bounded": types.MappingProxyType({
+        "elapsed_s": 600, "provider_calls": 5, "tool_calls": 20, "retrieval_bytes": 32768, "input_tokens": 8000,
+        "output_tokens": 1500, "retries": 0, "reconciliation_rounds": 1, "stages": 25}),
+})
+DASHBOARD_DEFAULT_PROFILE = "standard"
+PILOT_BUDGET_PROFILE = "pilot_bounded"
 
 # ---- liveness: bounded stage timeouts (seconds); heartbeat period
 HEARTBEAT_SECONDS = 5
@@ -326,6 +337,29 @@ def resolve_budgets(req):
             raise Denied("BUDGET_ABOVE_POLICY", "%s %d > %d" % (k, v, BUDGET_MAX[k]))
         out[k] = v
     return out
+
+
+def resolve_budget_profile(name):
+    """Strict resolver: only an allowlisted profile name; returns a fresh, fully resolved budget dict that has
+    passed resolve_budgets() (so never above BUDGET_MAX). Unknown/absent name fails closed."""
+    if not isinstance(name, str) or name not in DASHBOARD_BUDGET_PROFILES:
+        raise Denied("MALFORMED", "budget_profile")
+    prof = DASHBOARD_BUDGET_PROFILES[name]
+    if set(prof) != set(BUDGET_KEYS):
+        raise Denied("MALFORMED", "budget_profile incomplete")
+    return resolve_budgets(dict(prof))
+
+
+def budget_profile_name(b):
+    """Display only: the allowlisted profile whose resolved values equal b, else 'custom'."""
+    for n in DASHBOARD_BUDGET_PROFILES:
+        if b == resolve_budget_profile(n):
+            return n
+    return "custom"
+
+
+def budget_text(b):
+    return " · ".join("%s %s" % (k, b[k]) for k in BUDGET_KEYS if k in (b or {}))
 
 
 def build_exec_package(txn_id, revision, p, expires_at, pkg_nonce):
@@ -1439,12 +1473,16 @@ class Engine:
         self.s.put(rec, v)
         return self._verify(txn_id)
 
-    def owner_pilot_request(self, *, peer, remote_user_id, kind):
-        """Owner-only Dashboard entry for the two P1 real-HA Pilot targets. Proposal only, not authority."""
+    def owner_pilot_request(self, *, peer, remote_user_id, kind, budget_profile=PILOT_BUDGET_PROFILE):
+        """Owner-only Dashboard entry for the two P1 real-HA Pilot targets. Proposal only, not authority.
+        Always uses the exact pilot_bounded budget profile (any other selection fails closed; never standard)."""
         if peer != INGRESS_GATEWAY:
             raise Denied("NOT_INGRESS_GATEWAY", peer)
         if not remote_user_id or sha((OWNER_PIN_PREFIX + remote_user_id).encode()) != OWNER_PIN:
             raise Denied("NOT_OWNER", "request entry is owner-only")
+        if budget_profile != PILOT_BUDGET_PROFILE:
+            raise Denied("MALFORMED", "budget_profile")
+        budgets = resolve_budget_profile(PILOT_BUDGET_PROFILE)
         if kind == "read_sun":
             op, value, eff = "ha.state.read", {}, "GAOP reads the state of sun.sun (read-only); openai-api reviews it"
         elif kind in ("probe_on", "probe_off"):
@@ -1457,7 +1495,7 @@ class Engine:
         p = {"op": op, "target": HA_OP_TARGETS[op], "value": value,
              "scope": "exactly one allowlisted Home Assistant entity; no other entity or service",
              "effect": eff, "summary": "Dashboard P1 real-HA Pilot-target request", "ttl_seconds": 1800,
-             "route": "claude-api", "review_route": "openai-api", "evidence": "none"}
+             "route": "claude-api", "review_route": "openai-api", "evidence": "none", "budgets": budgets}
         env = json.dumps({"protocol": PROTOCOL, "op": "propose", "txn_id": txn, "role": "designer",
                           "envelope_id": "dash-" + txn, "proposal": p,
                           "changed_condition": "owner-new-dashboard-request " + txn})
@@ -1474,7 +1512,7 @@ class Engine:
             self._run_deferred()
         return out
 
-    def owner_request(self, *, peer, remote_user_id, value, route, evidence):
+    def owner_request(self, *, peer, remote_user_id, value, route, evidence, budget_profile=DASHBOARD_DEFAULT_PROFILE):
         """Dashboard request entry (owner only): creates a synthetic proposal, then the ChatGPT
         designer problem-check runs. Proposal creation is not authority."""
         if peer != INGRESS_GATEWAY:
@@ -1485,6 +1523,7 @@ class Engine:
             raise Denied("MALFORMED", "value")
         if route not in EXECUTOR_ROUTES or route not in PROVIDERS:
             raise Denied("PROVIDER_ROLE_VIOLATION", "%s is not an executor API route" % route)
+        budgets = resolve_budget_profile(budget_profile)
         txn = "TXN-08-DB-" + time.strftime("%Y%m%d%H%M%S", time.gmtime(self.clock()))
         p = {"op": "synthetic.echo", "target": "synthetic:echo", "value": {"msg": value},
              "scope": "synthetic-only; no Home Assistant state",
@@ -1492,7 +1531,8 @@ class Engine:
                         % (route, "; archives one synthetic evidence file to the existing GAOP folder, "
                            "verifies it, deletes it" if evidence == "drive" else "")),
              "summary": "Dashboard synthetic request", "ttl_seconds": 1800, "route": route,
-             "review_route": "openai-api", "evidence": "drive" if evidence == "drive" else "none"}
+             "review_route": "openai-api", "evidence": "drive" if evidence == "drive" else "none",
+             "budgets": budgets}
         env = json.dumps({"protocol": PROTOCOL, "op": "propose", "txn_id": txn, "role": "designer",
                           "envelope_id": "dash-" + txn, "proposal": p,
                           "changed_condition": "owner-new-dashboard-request " + txn})
@@ -1869,6 +1909,7 @@ class Engine:
                 "disagreement_kind": dg.get("kind"), "disagreement_outcome": dg.get("outcome"),
                 "prior_disagreements": [[x.get("kind"), x.get("issue_code"), x.get("outcome")]
                                         for x in rec.get("prior_disagreements", [])],
+                "budget_limits": (rec.get("budget") or {}).get("limits"),
                 "budget_used": (rec.get("budget") or {}).get("used"),
                 "last_checkpoint_state_version": (rec.get("last_checkpoint") or {}).get("state_version"),
                 "reconcile_resolution": (rec.get("reconcile") or {}).get("resolution"),
@@ -2160,6 +2201,7 @@ class Engine:
         v["disagreement"] = rec.get("disagreement")
         v["prior_disagreements"] = rec.get("prior_disagreements") or []
         v["ha"] = rec.get("ha")
+        v["package_budgets"] = (rec.get("exec_package") or {}).get("budgets")
         v["live"] = self.live_view(rec) if "budget" in rec else None
         if owner and rec["state"] in ("AWAITING_AUTHORITY", "DISAGREEMENT"):
             v["pending_nonce"] = rec["pending_nonce"]
@@ -2537,12 +2579,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self._panel(owner, notice="%s: %s" % (g("txn_id"), out.get("state"))), "text/html")
             if path == "/request":
                 out = self.engine.owner_request(peer=peer, remote_user_id=uid, value=g("value").strip(),
-                                                route=g("route"), evidence=g("evidence"))
+                                                route=g("route"), evidence=g("evidence"),
+                                                budget_profile=g("budget_profile") or DASHBOARD_DEFAULT_PROFILE)
                 log("REQUEST dashboard-owner -> %s" % json.dumps(out, sort_keys=True))
                 return self._send(200 if out.get("outcome") == "ACCEPTED" else 409,
                                   self._panel(owner, notice="request: %s %s" % (out.get("txn_id", ""), out.get("state") or out.get("code"))), "text/html")
             if path == "/pilot_request":
-                out = self.engine.owner_pilot_request(peer=peer, remote_user_id=uid, kind=g("kind"))
+                out = self.engine.owner_pilot_request(peer=peer, remote_user_id=uid, kind=g("kind"),
+                                                      budget_profile=g("budget_profile") or PILOT_BUDGET_PROFILE)
                 log("REQUEST dashboard-owner P1 -> %s" % json.dumps(out, sort_keys=True))
                 return self._send(200 if out.get("outcome") == "ACCEPTED" else 409,
                                   self._panel(owner, notice="P1 request: %s %s" % (out.get("txn_id", ""), out.get("state") or out.get("code"))), "text/html")
@@ -2654,12 +2698,15 @@ class Handler(BaseHTTPRequestHandler):
                 '<tr><td>Value</td><td>%s</td></tr><tr><td>Scope</td><td>%s</td></tr><tr><td>Effect</td><td>%s</td></tr>'
                 '<tr><td>Route</td><td>%s</td></tr><tr><td>Evidence</td><td>%s</td></tr>'
                 '<tr><td>Expires (UTC)</td><td>%s</td></tr><tr><td>Revision</td><td>%s</td></tr>'
-                '<tr><td>Proposal SHA-256</td><td class="h">%s</td></tr></table>%s</div>'
+                '<tr><td>Proposal SHA-256</td><td class="h">%s</td></tr>'
+                '<tr><td>Budget limits (bound by Authorize)</td><td>%s: %s</td></tr></table>%s</div>'
                 % (esc(v["txn_id"]), esc(v["state"]), esc(p["summary"]), esc(p["op"]), esc(p["target"]),
                    esc(json.dumps(p["value"])), esc(p["scope"]), esc(p["effect"]), esc(p["route"]),
                    esc(p.get("evidence", "none")),
                    esc(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(v["expires_at"]))),
-                   esc(v["revision"]), esc(v["proposal_sha256"]), extra + form))
+                   esc(v["revision"]), esc(v["proposal_sha256"]),
+                   esc(budget_profile_name(v.get("package_budgets"))), esc(budget_text(v.get("package_budgets"))),
+                   extra + form))
         recent = []
         for t in reversed(e.s.recent()):
             try:
@@ -2685,16 +2732,22 @@ class Handler(BaseHTTPRequestHandler):
                        '<input name="value" placeholder="synthetic value to echo" size="40" maxlength="80"> '
                        '<select name="route">%s</select> '
                        '<label><input type="checkbox" name="evidence" value="drive" checked> Drive evidence</label> '
+                       '<select name="budget_profile">%s</select> '
                        '<button>Create proposal</button></form><p class="st">Creates a proposal and asks ChatGPT (openai-api: %s) '
                        'to problem-check it. Claude executes only after you press Authorize; ChatGPT then reviews the result.</p></div>'
-                       % (base, opts_r, "configured" if ps["openai-api"]["configured"] else "NOT configured — results will be PARTIAL"))
+                       % (base, opts_r, "".join('<option value="%s"%s>budget: %s</option>'
+                                                % (n, " selected" if n == DASHBOARD_DEFAULT_PROFILE else "", n)
+                                                for n in DASHBOARD_BUDGET_PROFILES),
+                          "configured" if ps["openai-api"]["configured"] else "NOT configured — results will be PARTIAL"))
         if owner and provider_status(e.s)["claude-api"]["configured"]:
             req += ('<div class="card"><h3>P1 real-HA Pilot targets</h3><form method="post" action="%s/pilot_request">'
+                    '<input type="hidden" name="budget_profile" value="%s">'
                     '<button name="kind" value="read_sun">Read sun.sun</button> '
                     '<button name="kind" value="probe_on">Set gaop_pilot_probe ON</button> '
                     '<button name="kind" value="probe_off">Set gaop_pilot_probe OFF</button></form>'
                     '<p class="st">Creates a proposal only (exactly one allowlisted entity). It runs after you press '
-                    'Authorize on its card.</p></div>' % base)
+                    'Authorize on its card. Budget profile: <b>%s</b> (%s).</p></div>'
+                    % (base, PILOT_BUDGET_PROFILE, PILOT_BUDGET_PROFILE, esc(budget_text(resolve_budget_profile(PILOT_BUDGET_PROFILE)))))
         setup = ""
         if owner:
             ps = provider_status(e.s)
@@ -3808,6 +3861,126 @@ def run_selftest():
                 st8.get("TXN-P1-0021")["state"] == "DISAGREEMENT" and denied(lambda: auth8("TXN-P1-0021")))
             e8.transport = mk_review()
             e8.adapters.pop("ha_client", None)
+
+            # ================= v0.8.6 Dashboard budget profiles (DAI-IN-515) =================
+            # Fresh store/engine (capacity-independent); mock provider/reviewer/HA transports only.
+            stB = Store(os.path.join(td, "gaop86"))
+            save_provider_cred(stB, "claude-api", KEY_A, "")
+            save_provider_cred(stB, "openai-api", KEY_O, "test-model")
+            eB = Engine(stB, adapters={"mock-reviewer": mock_reviewer, "ha_client": HAClient(fha)}, clock=clk,
+                        transport=mk_review())
+            PB = {"elapsed_s": 600, "provider_calls": 5, "tool_calls": 20, "retrieval_bytes": 32768, "input_tokens": 8000,
+                  "output_tokens": 1500, "retries": 0, "reconciliation_rounds": 1, "stages": 25}
+            chk("BP default/max constants unchanged",
+                BUDGET_DEFAULT == {"elapsed_s": 900, "provider_calls": 5, "tool_calls": 30, "retrieval_bytes": 65536,
+                                   "input_tokens": 8000, "output_tokens": 1500, "retries": 0, "reconciliation_rounds": 1, "stages": 30}
+                and BUDGET_MAX == {"elapsed_s": 3600, "provider_calls": 6, "tool_calls": 60, "retrieval_bytes": 262144,
+                                   "input_tokens": 20000, "output_tokens": 4000, "retries": 1, "reconciliation_rounds": 1, "stages": 40})
+            chk("BP a standard == BUDGET_DEFAULT (all 9 keys)",
+                resolve_budget_profile("standard") == BUDGET_DEFAULT and set(resolve_budget_profile("standard")) == set(BUDGET_KEYS))
+            chk("BP b pilot_bounded == 600/5/20/32768/8000/1500/0/1/25",
+                resolve_budget_profile("pilot_bounded") == PB and [PB[k] for k in BUDGET_KEYS] == [600, 5, 20, 32768, 8000, 1500, 0, 1, 25])
+            chk("BP profiles immutable + every profile within BUDGET_MAX",
+                all(all(resolve_budget_profile(n)[k] <= BUDGET_MAX[k] for k in BUDGET_KEYS)
+                                                      for n in DASHBOARD_BUDGET_PROFILES)
+                and isinstance(DASHBOARD_BUDGET_PROFILES, types.MappingProxyType)
+                and all(isinstance(x, types.MappingProxyType) for x in DASHBOARD_BUDGET_PROFILES.values()))
+            nB = len(stB.active())
+            chk("BP c unknown profile fail-closed (resolver + both Dashboard entries, nothing created)",
+                all(denied(lambda x=x: resolve_budget_profile(x), "MALFORMED") for x in ("huge", "", None, "STANDARD", "custom", 5))
+                and denied(lambda: eB.owner_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, value="bp", route="claude-api",
+                                                    evidence="none", budget_profile="bogus"), "MALFORMED")
+                and denied(lambda: eB.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="read_sun",
+                                                          budget_profile="nope"), "MALFORMED")
+                and len(stB.active()) == nB)
+            clk.t += 2
+            rqs = eB.owner_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, value="bp std", route="claude-api", evidence="none")
+            clk.t += 2
+            rqp = eB.owner_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, value="bp pilot", route="claude-api",
+                                   evidence="none", budget_profile="pilot_bounded")
+            rs, rp = stB.get(rqs.get("txn_id")) or {}, stB.get(rqp.get("txn_id")) or {}
+            chk("BP d owner_request proposal+package carry selected fully-resolved budgets (default standard)",
+                rs.get("proposal", {}).get("budgets") == rs.get("exec_package", {}).get("budgets") == rs.get("budget", {}).get("limits") == BUDGET_DEFAULT
+                and rp.get("proposal", {}).get("budgets") == rp.get("exec_package", {}).get("budgets") == rp.get("budget", {}).get("limits") == PB
+                and eB.view(rp["txn_id"])["package_budgets"] == PB and eB.view(rp["txn_id"])["live"]["budget_limits"] == PB)
+            chk("BP e owner_pilot_request: pilot_bounded only, never standard",
+                denied(lambda: eB.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="read_sun",
+                                                      budget_profile="standard"), "MALFORMED"))
+            clk.t += 2
+            rpl = eB.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="read_sun")
+            rP = stB.get(rpl.get("txn_id")) or {}
+            chk("BP e pilot proposal/package/limits == pilot_bounded != BUDGET_DEFAULT; AWAITING_AUTHORITY",
+                rpl.get("state") == "AWAITING_AUTHORITY" and rP["proposal"]["budgets"] == rP["exec_package"]["budgets"]
+                == rP["budget"]["limits"] == PB and PB != BUDGET_DEFAULT and rP["authority"] is None
+                and rP["package_digest"] == package_digest(rP["exec_package"]))
+            pp = dict(rP["proposal"])
+            dB = package_digest(build_exec_package("TXN-BP-0001", 1, pp, 1900000000, "nB"))
+            dd = []
+            for k in BUDGET_KEYS:
+                q = dict(pp, budgets=dict(pp["budgets"]))
+                q["budgets"][k] = q["budgets"][k] - 1 if q["budgets"][k] > 0 else q["budgets"][k] + 1
+                dd.append(package_digest(build_exec_package("TXN-BP-0001", 1, q, 1900000000, "nB")) != dB)
+            chk("BP f changing any resolved budget changes package_digest (9/9)", all(dd) and len(dd) == 9
+                and package_digest(build_exec_package("TXN-BP-0001", 1, dict(pp, budgets=BUDGET_DEFAULT), 1900000000, "nB")) != dB)
+
+            def authB(txn, decision="authorize"):
+                v = eB.view(txn, owner=True)
+                return eB.owner_decision(peer=INGRESS_GATEWAY, remote_user_id=OWNER, txn_id=txn,
+                                         proposal_sha256=v["proposal_sha256"], state_version=v["state_version"],
+                                         nonce=v.get("pending_nonce") or "", decision=decision)
+            clk.t += 2
+            rg = eB.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="read_sun")
+            TG = rg["txn_id"]
+            authB(TG)
+            r = stB.get(TG)
+            ok_bind = (r["authority"]["package_digest"] == r["package_digest"] == package_digest(r["exec_package"])
+                       and r["exec_package"]["budgets"] == PB)
+            r["exec_package"]["budgets"] = dict(BUDGET_DEFAULT)                  # post-authority budget substitution
+            stB.put(r, r["state_version"])
+            n0, h0 = pcalls["n"], len(HCALLS)
+            chk("BP g authority binds budget-bearing package; post-authority budget change -> R1 STOP (no provider/HA call)",
+                ok_bind and denied(lambda: eB.api_execute(TG, transport=mk("anthropic")), "PACKAGE_DIGEST_MISMATCH")
+                and stB.get(TG)["state"] == "STOP" and pcalls["n"] == n0 and len(HCALLS) == h0)
+            TH8 = rp["txn_id"]
+            big = dict(rp["proposal"], budgets=dict(BUDGET_MAX))
+            chk("BP h executor/provider envelopes cannot enlarge/substitute budgets",
+                all(eB.apply_envelope(env(op, TH8, role="executor", **kw)).get("code") == "CAPABILITY_DENIED"
+                    for op, kw in (("revise", {"proposal": big}), ("propose", {"proposal": big})))
+                and eB.apply_envelope(env("revise", TH8, role="reviewer", proposal=big)).get("code") == "REVIEWER_MUTATION_DENIED"
+                and eB.apply_envelope(env("claim", TH8, budgets=BUDGET_MAX)).get("outcome") != "ACCEPTED"
+                and stB.get(TH8)["budget"]["limits"] == PB and stB.get(TH8)["exec_package"]["budgets"] == PB)
+            clk.t += 2
+            ri = eB.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="read_sun")
+            TI = ri["txn_id"]
+            authB(TI)
+            authB(rqs["txn_id"])                        # standard control, authorised at the same instant
+            clk.t += 601                                # > pilot_bounded 600 s, < standard 900 s
+            n0, h0 = pcalls["n"], len(HCALLS)
+            lowstop = denied(lambda: eB.api_execute(TI, transport=mk("anthropic")), "BUDGET_EXHAUSTED") \
+                and stB.get(TI)["state"] == "STOP" and stB.get(TI)["budget"]["exhausted"] == "elapsed_s" \
+                and pcalls["n"] == n0 and len(HCALLS) == h0
+            ctl = eB.api_execute(rqs["txn_id"], transport=mk("anthropic"))
+            chk("BP i lower selected limit actually enforced (pilot 600 s -> STOP; standard control at 601 s proceeds)",
+                lowstop and ctl.get("state") in ("REVIEWING", "COMPLETED") and stB.get(rqs["txn_id"])["state"] == "COMPLETED" and stB.get(rqs["txn_id"])["budget"]["limits"]["elapsed_s"] == 900)
+            clk.t += 2
+            rj = eB.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="read_sun")
+            TJ = rj["txn_id"]
+            authB(TJ)
+            oj = eB.api_execute(TJ, transport=mk("anthropic"))
+            r = stB.get(TJ)
+            rc = r.get("receipt") or {}
+            chk("BP j receipt carries budget_limits + budget_used matching the record",
+                r["state"] == "COMPLETED" and rc.get("final_state") == "COMPLETED" and rc.get("budget_limits") == r["budget"]["limits"] == PB
+                and rc.get("budget_used") == r["budget"]["used"] and rc["budget_used"]["provider_calls"] >= 1
+                and rc["receipt_sha256"] == sha(canon({k: x for k, x in rc.items() if k != "receipt_sha256"})))
+            chk("BP k BUDGET_ABOVE_POLICY unchanged",
+                denied(lambda: resolve_budgets({"stages": 41}), "BUDGET_ABOVE_POLICY")
+                and denied(lambda: resolve_budgets({"provider_calls": 7}), "BUDGET_ABOVE_POLICY")
+                and resolve_budgets(dict(BUDGET_MAX)) == BUDGET_MAX)
+            chk("BP display helpers: profile name + limits text",
+                budget_profile_name(PB) == "pilot_bounded" and budget_profile_name(BUDGET_DEFAULT) == "standard"
+                and budget_profile_name({"elapsed_s": 1}) == "custom" and "elapsed_s 600" in budget_text(PB)
+                and "stages 25" in budget_text(PB))
 
             # --- unsupported newer store schema fails closed ---
             m = os.path.join(td, "gaop", "meta.json")
