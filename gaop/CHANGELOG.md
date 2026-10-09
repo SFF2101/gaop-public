@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.10 (DAI-IN-525 live-verification fixes to the Home page; presentation only)
+- The ChatGPT plan check runs in the background after Ask. Until it is back (max 60 s), the Home card now says
+  "ChatGPT is checking this plan…", shows no decision buttons (they would be refused as stale) and the page refreshes
+  itself. If no check arrives within 60 s the buttons return and the plan is described as unchecked.
+- Home says "ChatGPT checked this plan and found no problems" only when the check is bound (status RECEIVED). An
+  unbound check (e.g. REVIEW_BINDING_MISMATCH) is described as "could not be confirmed … treat this plan as unchecked".
+  Engine behaviour for unbound design checks is unchanged.
+- Home posts that create a request or record a decision answer with 303 → a fresh Home page, so a browser refresh
+  cannot re-send them. Clarification / "can't do that" replies still render directly.
+- Selftest 243 checks (239 prior unchanged + 4 new).
+
 ## 0.8.9 (DAI-IN-525 two-page hobby-friendly conversational Dashboard)
 - Page 1 "GAOP" (`/`): "What would you like me to do?" text box + Ask, plain-language replies, and one conversational
   card per transaction with the existing Authorize / Revise / Reject (Cancel) controls directly underneath; plain-language
