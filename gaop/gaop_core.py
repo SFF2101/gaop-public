@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAOP v0.8.9 — production dual-AI build (+ DAI-IN-525 two-page conversational Dashboard) (+ DAI-IN-524 production Dashboard UX) (+ DAI-IN-515 Dashboard budget profiles, DAI-IN-518 HA-path metering) (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
+"""GAOP v0.8.10 — production dual-AI build (+ DAI-IN-525 two-page conversational Dashboard) (+ DAI-IN-524 production Dashboard UX) (+ DAI-IN-515 Dashboard budget profiles, DAI-IN-518 HA-path metering) (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
 
 Single stdlib-only module. Roles (repository-role invariant):
   GitHub private repo = source; gaop-public = generated secret-free distribution;
@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time, types
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.9"
+VERSION = "0.8.10"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -380,6 +380,7 @@ def budget_profile_label(b):
 # and never carries authority: the compiled kind is submitted through owner_pilot_request (same proposal,
 # design check, owner Authorize and execution path). The prose itself is never sent to any provider.
 ASK_MAX_CHARS = 300
+CHECK_WAIT_S = 60          # v0.8.10: max time Home withholds decision buttons while the plan check is pending
 ASK_ENTITY_RE = re.compile(r"\b[a-z_]+\.[a-z0-9_]{2,}\b")
 ASK_ALLOWED_ENTITIES = frozenset({"sun.sun", "input_boolean.gaop_pilot_probe"})
 ASK_CAPABILITIES = ('Right now I can: check whether the sun is up (sun.sun), or turn the GAOP test switch '
@@ -2654,6 +2655,14 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, json.dumps(obj, sort_keys=True))
 
+    def _see_home(self):
+        """v0.8.10 Post/Redirect/Get to the Home page (same ingress base). No state change."""
+        self.send_response(303)
+        self.send_header("Location", self._base() + "/")
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def do_GET(self):
         peer, uid, owner = self._ident()
         path = self.path.split("?")[0].rstrip("/") or "/"
@@ -2730,12 +2739,14 @@ class Handler(BaseHTTPRequestHandler):
                     % (g("txn_id"), g("decision"), out.get("state")))
                 self._maybe_api(g("txn_id"), out)
                 if g("return_to") == "home":
-                    return self._send(200, self._home(owner), "text/html")
+                    return self._see_home()
                 return self._send(200, self._panel(owner, notice="%s: %s" % (g("txn_id"), out.get("state"))), "text/html")
             if path == "/ask":
                 out = self.engine.owner_ask(peer=peer, remote_user_id=uid, text=g("text"))
                 log("ASK dashboard-owner -> %s" % json.dumps({k: out.get(k) for k in
                                                               ("outcome", "state", "txn_id", "code")}, sort_keys=True))
+                if out.get("txn_id"):
+                    return self._see_home()        # v0.8.10: a request was created -> fresh GET (refresh cannot re-send)
                 return self._send(200, self._home(owner, reply=out), "text/html")
             if path == "/request":
                 out = self.engine.owner_request(peer=peer, remote_user_id=uid, value=g("value").strip(),
@@ -2853,10 +2864,20 @@ class Handler(BaseHTTPRequestHandler):
             what = "run a synthetic self-test"
             safety = "This does not change anything in Home Assistant."
         dr = v.get("design_review") or {}
-        if dr.get("verdict") == "NO_OBJECTION":
+        lv = v.get("live") or {}
+        # v0.8.10: until the (asynchronous) plan check is back, the decision controls would be stale, so they are
+        # withheld for a bounded time while the page refreshes; a check counts as clean only if it is bound.
+        checking = (st == "AWAITING_AUTHORITY" and not dr and (lv.get("stage_elapsed_s") or 0) < CHECK_WAIT_S)
+        if dr.get("verdict") == "NO_OBJECTION" and dr.get("status") == "RECEIVED":
             check = "ChatGPT checked this plan and found no problems."
+        elif dr.get("status") and dr.get("status") != "RECEIVED":
+            check = ("ChatGPT's plan check could not be confirmed (%s), so treat this plan as unchecked. "
+                     "Look at the details before you decide." % {"REVIEW_BINDING_MISMATCH": "its reply did not match this request",
+                                                                  "UNAVAILABLE": "the check is not set up"}.get(dr["status"], dr["status"]))
         elif dr:
-            check = "ChatGPT's plan check did not come back clean: %s" % (dr.get("claim") or dr.get("verdict") or dr.get("status"))
+            check = "ChatGPT's plan check did not come back clean: %s" % (dr.get("claim") or dr.get("verdict"))
+        elif st == "AWAITING_AUTHORITY" and not checking:
+            check = "ChatGPT's plan check has not come back, so treat this plan as unchecked. Look at the details before you decide."
         else:
             check = ""
         rc = rec.get("receipt") or {}
@@ -2865,10 +2886,14 @@ class Handler(BaseHTTPRequestHandler):
             out.append('<p class="you">You asked: “%s”</p>' % esc(rec["ask_text"]))
         if st == "AWAITING_AUTHORITY":
             out.append("<p>I would like to %s.</p><p>%s</p>" % (esc(what), esc(safety)))
-            if check:
-                out.append("<p>%s</p>" % esc(check))
-            out.append("<p>Nothing happens until you press <b>Authorize</b>.</p>" if owner
-                       else "<p>Waiting for the owner's decision.</p>")
+            if checking:
+                out.append("<p>ChatGPT is checking this plan… This page refreshes by itself; your choices appear "
+                           "when the check is back.</p>")
+            else:
+                if check:
+                    out.append("<p>%s</p>" % esc(check))
+                out.append("<p>Nothing happens until you press <b>Authorize</b>.</p>" if owner
+                           else "<p>Waiting for the owner's decision.</p>")
         elif st == "DISAGREEMENT":
             dg = v.get("disagreement") or {}
             cl = dg.get("claims") or {}
@@ -2903,11 +2928,10 @@ class Handler(BaseHTTPRequestHandler):
             out.append("<p>Outcome uncertain. I could not confirm whether the change happened, and I will not retry "
                        "on my own. Please check Home Assistant and the details.</p>")
         else:
-            lv = v.get("live") or {}
             out.append("<p>Working on it… (%ss so far). This page refreshes by itself.</p>" % esc(lv.get("txn_elapsed_s", 0)))
         det = "%s/api/%s/%s" % (base, "receipt" if rc.get("receipt_sha256") else "txn", esc(v["txn_id"]))
         out.append('<p class="st"><a href="%s">Details</a></p>' % det)
-        form = self._decision_form(v, base, return_to="home", reject_label="Reject / Cancel") if owner else ""
+        form = self._decision_form(v, base, return_to="home", reject_label="Reject / Cancel") if owner and not checking else ""
         return '<div class="card say">%s%s</div>' % ("".join(out), form)
 
     def _home(self, owner, notice="", reply=None):
@@ -2948,9 +2972,11 @@ class Handler(BaseHTTPRequestHandler):
                 latest = '<p class="st">Latest result</p>' + self._converse(e.s.get(t) or {}, e.view(t), False, base)
             except Denied:
                 latest = ""
-        busy = any((e.s.get(t) or {}).get("state") not in (None, "AWAITING_AUTHORITY", "DISAGREEMENT", "DISPATCHED",
-                                                          "UNKNOWN_RECONCILE", "PROPOSED")
-                   for t in e.s.active())
+        def _busy(r):
+            return (r.get("state") not in (None, "AWAITING_AUTHORITY", "DISAGREEMENT", "DISPATCHED", "UNKNOWN_RECONCILE", "PROPOSED")
+                    or (r.get("state") == "AWAITING_AUTHORITY" and not r.get("design_review")
+                        and e.clock() - r.get("stage_entered", r.get("updated", e.clock())) < CHECK_WAIT_S + 2 * HEARTBEAT_SECONDS))
+        busy = any(_busy(e.s.get(t) or {}) for t in e.s.active())
         refresh = ("<meta http-equiv='refresh' content='%d;url=%s/'>" % (HEARTBEAT_SECONDS, base)) if busy else ""
         return ("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' "
                 "content='width=device-width,initial-scale=1'>" + refresh + "<title>GAOP</title><style>" + PANEL_CSS
@@ -4608,6 +4634,61 @@ def run_selftest():
                 all("successfully" not in w for w in words.values()) and "Stopped" in words["STOP"]
                 and "Not fully confirmed" in words["PARTIAL"] and "Outcome uncertain" in words["UNKNOWN_RECONCILE"]
                 and "Cancelled" in words["REJECTED"] and "Working on it" in words["RUNNING"])
+
+            # ================= v0.8.10 Home presentation fixes (DAI-IN-525 live finding) =================
+            clk.t += 2
+            rq = eV.owner_ask(peer=INGRESS_GATEWAY, remote_user_id=OWNER, text="Is the sun up?")
+            rQ = stV.get(rq["txn_id"])
+            rQ["design_review"] = None                       # simulate the asynchronous plan check still pending
+            stV.put(rQ, rQ["state_version"])
+            cq = txt(hV2._converse(stV.get(rq["txn_id"]), eV.view(rq["txn_id"], owner=True), True, "."))
+            hq = hV2._home(True)
+            chk("CV 21 plan check pending: card says checking, no decision buttons, Home auto-refreshes",
+                "ChatGPT is checking this plan" in cq and 'value="authorize"' not in hV2._converse(
+                    stV.get(rq["txn_id"]), eV.view(rq["txn_id"], owner=True), True, ".")
+                and "http-equiv='refresh'" in hq)
+            clk.t += CHECK_WAIT_S + 1
+            hl = hV2._converse(stV.get(rq["txn_id"]), eV.view(rq["txn_id"], owner=True), True, ".")
+            chk("CV 21b check still missing after bound wait: buttons return, plan described as unchecked",
+                'value="authorize"' in hl and "treat this plan as unchecked" in txt(hl) and "found no problems" not in txt(hl))
+            rQ = stV.get(rq["txn_id"])
+            rQ["design_review"] = {"verdict": "NO_OBJECTION", "status": "REVIEW_BINDING_MISMATCH", "claim": "ok"}
+            stV.put(rQ, rQ["state_version"])
+            hm = hV2._converse(stV.get(rq["txn_id"]), eV.view(rq["txn_id"], owner=True), True, ".")
+            chk("CV 22 unbound plan check is never presented as clean; engine state/semantics unchanged",
+                "found no problems" not in txt(hm) and "could not be confirmed" in txt(hm) and 'value="authorize"' in hm
+                and stV.get(rq["txn_id"])["state"] == "AWAITING_AUTHORITY" and stV.get(rq["txn_id"])["authority"] is None)
+            import io
+
+            def post(path, form):
+                h = Handler.__new__(Handler)
+                h.engine, h.cred = eV, _CredStub()
+                h.att = {"attestation": "MATCH", "ok": True, "private_source_commit": "d" * 40}
+                body = urllib.parse.urlencode(form).encode()
+                h.headers = {"Content-Length": str(len(body)), "X-Remote-User-Id": OWNER}
+                h.client_address, h.path, h.command = (INGRESS_GATEWAY, 1), path, "POST"
+                h.request_version, h.requestline = "HTTP/1.1", "POST " + path
+                h.rfile, h.wfile = io.BytesIO(body), io.BytesIO()
+                h.do_POST()
+                return h.wfile.getvalue().decode(errors="replace")
+            nA = len(stV.active())
+            clk.t += 2
+            p1 = post("/ask", {"text": "Turn the GAOP test switch off"})
+            n1 = len(stV.active())
+            newt = [t for t in stV.active() if t != rq["txn_id"]][-1]
+            p2 = post("/ask", {"text": "unlock the front door"})
+            n2 = len(stV.active())
+            vN = eV.view(newt, owner=True)
+            p3 = post("/authority", {"txn_id": newt, "proposal_sha256": vN["proposal_sha256"], "state_version": vN["state_version"],
+                                     "nonce": vN["pending_nonce"], "decision": "reject", "return_to": "home"})
+            p4 = post("/authority", {"txn_id": newt, "proposal_sha256": vN["proposal_sha256"], "state_version": vN["state_version"],
+                                     "nonce": vN["pending_nonce"], "decision": "reject", "return_to": "home"})
+            chk("CV 23 Home posts that create/decide redirect (303 -> fresh Home); replies render inline; replays refused safely",
+                " 303 See Other" in p1.split("\r\n")[0] and "Location: ./\r\n" in p1 and n1 == nA + 1
+                and " 200 OK" in p2.split("\r\n")[0] and "do that yet" in p2 and n2 == n1
+                and " 303 See Other" in p3.split("\r\n")[0] and stV.get(newt)["state"] == "REJECTED"
+                and stV.get(newt)["authority"] is None
+                and " 403 " in p4.split("\r\n")[0] and "nothing was done" in p4 and "<form" in p4)
 
             # --- unsupported newer store schema fails closed ---
             m = os.path.join(td, "gaop", "meta.json")
