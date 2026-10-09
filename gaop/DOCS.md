@@ -1,5 +1,10 @@
 # GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
 
+**v0.8.11:** a consequential change (e.g. turning the GAOP test switch on/off) can only be authorized when
+ChatGPT's plan check is confirmed against that exact plan. If it is unbound, unavailable or missing, Home says
+"I couldn't confirm ChatGPT's check against this exact plan, so I won't let this change run yet." and offers only
+Revise / Reject; the server refuses Authorize (`REVIEW_NOT_BOUND`) however it is sent. Read-only requests are unaffected.
+
 **v0.8.9:** two pages. **Home** (the panel's first page) is a simple "What would you like me to do?" box: GAOP
 replies in plain language, and anything it would do appears as a short proposal with Authorize / Revise /
 Reject (Cancel) underneath; nothing runs until you press Authorize. Today it understands: whether the sun is up

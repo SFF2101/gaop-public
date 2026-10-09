@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAOP v0.8.10 — production dual-AI build (+ DAI-IN-525 two-page conversational Dashboard) (+ DAI-IN-524 production Dashboard UX) (+ DAI-IN-515 Dashboard budget profiles, DAI-IN-518 HA-path metering) (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
+"""GAOP v0.8.11 — production dual-AI build (+ DAI-IN-526 consequential review gate) (+ DAI-IN-525 two-page conversational Dashboard) (+ DAI-IN-524 production Dashboard UX) (+ DAI-IN-515 Dashboard budget profiles, DAI-IN-518 HA-path metering) (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
 
 Single stdlib-only module. Roles (repository-role invariant):
   GitHub private repo = source; gaop-public = generated secret-free distribution;
@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time, types
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.10"
+VERSION = "0.8.11"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -371,6 +371,28 @@ def budget_profile_label(b):
     """Display only: production-facing label for the profile whose resolved values equal b."""
     n = budget_profile_name(b)
     return DASHBOARD_PROFILE_LABELS.get(n, n)
+
+
+# ============================== v0.8.11 consequential authorization gate (DAI-IN-526) ==============================
+# Owner authority for a consequential operation (any "ha." operation that is not read-only) is accepted only when the
+# ChatGPT design review is bound to the exact current package: status RECEIVED (set by design_check only after
+# _review_bound matched txn_id, the current package_digest and correlation_id; any revision resets design_review) AND
+# verdict NO_OBJECTION. A clean verdict with a mismatched, unavailable, uncertain or missing review is refused
+# (REVIEW_NOT_BOUND). Read-only and synthetic operations keep their existing policy. There is no override.
+HA_READ_OPS = frozenset({"ha.state.read"})
+
+
+def is_consequential_op(op):
+    return isinstance(op, str) and op.startswith("ha.") and op not in HA_READ_OPS
+
+
+def design_review_bound(rec):
+    dr = rec.get("design_review") or {}
+    return dr.get("status") == "RECEIVED" and dr.get("verdict") == "NO_OBJECTION"
+
+
+def authority_review_ok(rec):
+    return (not is_consequential_op((rec.get("proposal") or {}).get("op"))) or design_review_bound(rec)
 
 
 # ============================== v0.8.9 conversational intake (DAI-IN-525) ==============================
@@ -2105,6 +2127,11 @@ class Engine:
                 raise Denied("MALFORMED", "decision")
             if package_digest(rec["exec_package"]) != rec["package_digest"]:
                 raise Denied("PACKAGE_DIGEST_MISMATCH", "pre-authority")
+            if not authority_review_ok(rec):
+                # v0.8.11 (DAI-IN-526): consequential authority requires a design review bound to this exact
+                # package. Raised before anything is persisted: no authority, no dispatch, nonce still usable
+                # for Reject / Revise.
+                raise Denied("REVIEW_NOT_BOUND", (rec.get("design_review") or {}).get("status") or "MISSING")
             a = {"txn_id": txn_id, "proposal_sha256": rec["proposal_sha256"],
                  "revision": rec["revision"], "scope": rec["proposal"]["scope"],
                  "target": rec["proposal"]["target"], "expires_at": rec["expires_at"],
@@ -2835,10 +2862,11 @@ class Handler(BaseHTTPRequestHandler):
                 btn += '<button name="decision" value="reconsider">Ask both to reconsider once</button> '
             btn += '<button name="decision" value="reject">Reject / Cancel</button>'
             return '<form method="post" action="%s/authority">%s%s</form>' % (base, hid, btn)
-        return ('<form method="post" action="%s/authority">%s'
-                '<button name="decision" value="authorize" class="go">Authorize</button> '
+        auth_btn = ('<button name="decision" value="authorize" class="go">Authorize</button> '
+                    if authority_review_ok(v) else "")      # v0.8.11: mirrors the server-side REVIEW_NOT_BOUND gate
+        return ('<form method="post" action="%s/authority">%s%s'
                 '<button name="decision" value="reject">%s</button> '
-                '<button name="decision" value="revise">Revise</button></form>' % (base, hid, esc(reject_label)))
+                '<button name="decision" value="revise">Revise</button></form>' % (base, hid, auth_btn, esc(reject_label)))
 
     # ---------- v0.8.9 Home / Ask GAOP page (DAI-IN-525): plain-language presentation of existing transactions ----------
     @staticmethod
@@ -2889,6 +2917,9 @@ class Handler(BaseHTTPRequestHandler):
             if checking:
                 out.append("<p>ChatGPT is checking this plan… This page refreshes by itself; your choices appear "
                            "when the check is back.</p>")
+            elif not authority_review_ok(v):
+                out.append("<p>I couldn't confirm ChatGPT's check against this exact plan, so I won't let this change "
+                           "run yet.</p><p>You can reject it, or revise it and ask again.</p>")
             else:
                 if check:
                     out.append("<p>%s</p>" % esc(check))
@@ -3004,6 +3035,10 @@ class Handler(BaseHTTPRequestHandler):
             if dr:
                 extra += ('<p class="st">ChatGPT design check: <b>%s</b> %s %s</p>'
                           % (esc(dr.get("verdict") or dr.get("status")), esc(dr.get("issue_code") or ""), esc(dr.get("claim") or "")))
+            if v["state"] == "AWAITING_AUTHORITY" and not authority_review_ok(v):
+                extra += ('<p class="n">Authorize unavailable: consequential operation and the ChatGPT design review is not '
+                          'bound to this exact package (review status: <b>%s</b>). Reject or Revise.</p>'
+                          % esc(dr.get("status") or ("PENDING" if not dr else "UNKNOWN")))
             lv = v.get("live") or {}
             if v["state"] not in ("AWAITING_AUTHORITY", "DISAGREEMENT", "PROPOSED"):
                 extra += ('<p class="st">Stage <b>%s</b> · stage %ss · total %ss · %s · last checkpoint v%s</p>'
@@ -3622,7 +3657,12 @@ def run_selftest():
                 return {"mode": "drive", "status": "ARCHIVED_VERIFIED", "sha256": "x", "integrity": "MATCH"}
             e8 = Engine(st8, adapters={"drive_evidence": fd8, "mock-reviewer": mock_reviewer}, clock=clk, transport=mk_review())
 
+            # v0.8.11 fixture: production always runs the ChatGPT design check before an owner can authorize; envelope-
+            # proposed consequential test transactions get the same real design_check (mock reviewer) first.
             def auth8(txn, decision="authorize"):
+                if decision == "authorize" and is_consequential_op(e8.s.get(txn)["proposal"]["op"]) \
+                        and not e8.s.get(txn).get("design_review") and e8.s.get(txn)["state"] == "AWAITING_AUTHORITY":
+                    e8.design_check(txn)
                 v = e8.view(txn, owner=True)
                 return e8.owner_decision(peer=INGRESS_GATEWAY, remote_user_id=OWNER, txn_id=txn,
                                          proposal_sha256=v["proposal_sha256"], state_version=v["state_version"],
@@ -4258,7 +4298,12 @@ def run_selftest():
             chk("BP f changing any resolved budget changes package_digest (9/9)", all(dd) and len(dd) == 9
                 and package_digest(build_exec_package("TXN-BP-0001", 1, dict(pp, budgets=BUDGET_DEFAULT), 1900000000, "nB")) != dB)
 
+            # v0.8.11 fixture: production always runs the ChatGPT design check before an owner can authorize; envelope-
+            # proposed consequential test transactions get the same real design_check (mock reviewer) first.
             def authB(txn, decision="authorize"):
+                if decision == "authorize" and is_consequential_op(eB.s.get(txn)["proposal"]["op"]) \
+                        and not eB.s.get(txn).get("design_review") and eB.s.get(txn)["state"] == "AWAITING_AUTHORITY":
+                    eB.design_check(txn)
                 v = eB.view(txn, owner=True)
                 return eB.owner_decision(peer=INGRESS_GATEWAY, remote_user_id=OWNER, txn_id=txn,
                                          proposal_sha256=v["proposal_sha256"], state_version=v["state_version"],
@@ -4327,7 +4372,12 @@ def run_selftest():
             def gbytes(ent):            # exact raw body the deterministic HA fixture returns for GET /states/<ent>
                 return len(json.dumps({"entity_id": ent, "state": HS[ent], "last_changed": "t"}).encode())
 
+            # v0.8.11 fixture: production always runs the ChatGPT design check before an owner can authorize; envelope-
+            # proposed consequential test transactions get the same real design_check (mock reviewer) first.
             def authC(txn):
+                if is_consequential_op(eC.s.get(txn)["proposal"]["op"]) and not eC.s.get(txn).get("design_review") \
+                        and eC.s.get(txn)["state"] == "AWAITING_AUTHORITY":
+                    eC.design_check(txn)
                 v = eC.view(txn, owner=True)
                 return eC.owner_decision(peer=INGRESS_GATEWAY, remote_user_id=OWNER, txn_id=txn,
                                          proposal_sha256=v["proposal_sha256"], state_version=v["state_version"],
@@ -4689,6 +4739,176 @@ def run_selftest():
                 and " 303 See Other" in p3.split("\r\n")[0] and stV.get(newt)["state"] == "REJECTED"
                 and stV.get(newt)["authority"] is None
                 and " 403 " in p4.split("\r\n")[0] and "nothing was done" in p4 and "<form" in p4)
+
+            # ================= v0.8.11 consequential authorization gate (DAI-IN-526) =================
+            stG = Store(os.path.join(td, "gaop811"))
+            save_provider_cred(stG, "claude-api", KEY_A, "")
+            save_provider_cred(stG, "openai-api", KEY_O, "test-model")
+            good_rt = mk_review()
+
+            def badbind_rt(url, headers, body, timeout):
+                st_, h_, raw = good_rt(url, headers, body, timeout)
+                j = json.loads(raw)
+                c = json.loads(j["choices"][0]["message"]["content"])
+                c["package_digest"] = "0" * 64                      # clean verdict, wrong binding
+                j["choices"][0]["message"]["content"] = json.dumps(c)
+                return st_, h_, json.dumps(j).encode()
+            eG = Engine(stG, adapters={"mock-reviewer": mock_reviewer, "ha_client": HAClient(fha)}, clock=clk, transport=good_rt)
+
+            def vG(t):
+                return eG.view(t, owner=True)
+
+            def decG(t, d, **over):
+                v = vG(t)
+                a = dict(proposal_sha256=v["proposal_sha256"], state_version=v["state_version"], nonce=v.get("pending_nonce") or "")
+                a.update(over)
+                return eG.owner_decision(peer=INGRESS_GATEWAY, remote_user_id=OWNER, txn_id=t, decision=d, **a)
+            HMODE.update(post=200, get=200, post_raise=False)
+            want1 = "off" if HS["input_boolean.gaop_pilot_probe"] == "on" else "on"
+            clk.t += 2
+            g1 = eG.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="probe_" + want1)["txn_id"]
+            r1 = stG.get(g1)
+            o1 = decG(g1, "authorize")
+            nG = len(HCALLS)
+            eG.api_execute(g1, transport=mk("anthropic"))
+            chk("GT 1 consequential + bound RECEIVED review -> Authorize proceeds normally (dispatch, execution, receipt)",
+                r1["design_review"]["status"] == "RECEIVED" and r1["design_review"]["verdict"] == "NO_OBJECTION"
+                and authority_review_ok(r1) and o1.get("state") == "DISPATCHED" and stG.get(g1)["state"] == "COMPLETED"
+                and HS["input_boolean.gaop_pilot_probe"] == want1 and len(HCALLS) == nG + 3)
+            eG.transport = badbind_rt
+            clk.t += 2
+            g2 = eG.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="probe_on")["txn_id"]
+            r2 = stG.get(g2)
+            sv2, nonce2, pre2, hc2 = r2["state_version"], r2["pending_nonce"], HS["input_boolean.gaop_pilot_probe"], len(HCALLS)
+            chk("GT 2 consequential + REVIEW_BINDING_MISMATCH (verdict NO_OBJECTION) -> Authorize denied, nothing persisted",
+                r2["design_review"]["status"] == "REVIEW_BINDING_MISMATCH" and r2["design_review"]["verdict"] == "NO_OBJECTION"
+                and denied(lambda: decG(g2, "authorize"), "REVIEW_NOT_BOUND")
+                and stG.get(g2)["state"] == "AWAITING_AUTHORITY" and stG.get(g2)["authority"] is None
+                and stG.get(g2)["dispatch"] is None and stG.get(g2)["state_version"] == sv2
+                and stG.get(g2)["pending_nonce"] == nonce2 and nonce2 not in stG.get(g2)["used_nonces"]
+                and len(HCALLS) == hc2 and HS["input_boolean.gaop_pilot_probe"] == pre2)
+            chk("GT 3 verdict alone is insufficient (predicate)",
+                not design_review_bound({"design_review": {"verdict": "NO_OBJECTION", "status": "REVIEW_BINDING_MISMATCH"}})
+                and not design_review_bound({"design_review": {"verdict": "NO_OBJECTION", "status": "PROVIDER_AUTHORITY_CLAIM"}})
+                and not design_review_bound({"design_review": {"verdict": "NO_OBJECTION"}})
+                and not design_review_bound({"design_review": {"status": "RECEIVED", "verdict": "DISAGREE_DESIGN"}})
+                and not design_review_bound({"design_review": None})
+                and design_review_bound({"design_review": {"status": "RECEIVED", "verdict": "NO_OBJECTION"}})
+                and is_consequential_op("ha.input_boolean.set") and is_consequential_op("ha.anything_new")
+                and not is_consequential_op("ha.state.read") and not is_consequential_op("synthetic.echo"))
+            eG.transport = mk_review(status=503)
+            clk.t += 2
+            g3 = eG.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="probe_on")["txn_id"]
+            clk.t += 2
+            g3b = eG.apply_envelope(env("propose", "TXN-GT-0003", proposal=prop(
+                op="ha.input_boolean.set", target=HA_OP_TARGETS["ha.input_boolean.set"], route="claude-api",
+                review_route="openai-api", value={"state": "on"})))
+            hc3 = len(HCALLS)
+            chk("GT 4 consequential + unavailable or missing review -> same fail-closed denial, no dispatch",
+                (stG.get(g3)["design_review"] or {}).get("status") not in (None, "RECEIVED")
+                and denied(lambda: decG(g3, "authorize"), "REVIEW_NOT_BOUND")
+                and g3b.get("state") == "AWAITING_AUTHORITY" and stG.get("TXN-GT-0003").get("design_review") is None
+                and denied(lambda: decG("TXN-GT-0003", "authorize"), "REVIEW_NOT_BOUND")
+                and stG.get(g3)["authority"] is None and stG.get("TXN-GT-0003")["authority"] is None
+                and stG.get(g3)["dispatch"] is None and len(HCALLS) == hc3)
+            eG.transport = badbind_rt
+            clk.t += 2
+            ga = eG.owner_ask(peer=INGRESS_GATEWAY, remote_user_id=OWNER, text="Turn the GAOP test switch on")["txn_id"]
+
+            def postG(path, form):
+                h = Handler.__new__(Handler)
+                h.engine, h.cred = eG, _CredStub()
+                h.att = {"attestation": "MATCH", "ok": True, "private_source_commit": "e" * 40}
+                body = urllib.parse.urlencode(form).encode()
+                h.headers = {"Content-Length": str(len(body)), "X-Remote-User-Id": OWNER}
+                h.client_address, h.path, h.command = (INGRESS_GATEWAY, 1), path, "POST"
+                h.request_version, h.requestline = "HTTP/1.1", "POST " + path
+                h.rfile, h.wfile = io.BytesIO(body), io.BytesIO()
+                h.do_POST()
+                return h.wfile.getvalue().decode(errors="replace")
+            hc5 = len(HCALLS)
+            vA_ = vG(ga)
+            fA = {"txn_id": ga, "proposal_sha256": vA_["proposal_sha256"], "state_version": vA_["state_version"],
+                  "nonce": vA_["pending_nonce"], "decision": "authorize"}
+            q1 = postG("/authority", fA)
+            q2 = postG("/authority", dict(fA, return_to="home"))
+            q3 = eG.apply_envelope(json.dumps({"protocol": PROTOCOL, "op": "claim", "txn_id": ga, "role": "executor",
+                                               "envelope_id": "e-gt5", "authority": {"forged": True}}))
+            q4 = eG.apply_envelope(env("propose", "TXN-GT-0005", proposal=prop(
+                op="ha.input_boolean.set", target=HA_OP_TARGETS["ha.input_boolean.set"], route="claude-api",
+                review_route="openai-api", value={"state": "on"}), authority={"granted": True}))
+            chk("GT 5 no bypass: System POST, Home POST, prose-created request, envelope authority and alternate routes all refused",
+                stG.get(ga)["design_review"]["status"] == "REVIEW_BINDING_MISMATCH"
+                and " 403 " in q1.split("\r\n")[0] and "REVIEW_NOT_BOUND" in q1
+                and " 403 " in q2.split("\r\n")[0] and "Nothing was changed" in q2
+                and q3.get("outcome") == "DENIED" and q4.get("outcome") == "DENIED"
+                and denied(lambda: decG(ga, "authorize_anyway"), "MALFORMED") and denied(lambda: decG(ga, "override"), "MALFORMED")
+                and stG.get(ga)["authority"] is None and stG.get(ga)["dispatch"] is None and len(HCALLS) == hc5)
+            chk("GT 6 stale-view / hash / nonce / replay controls still independently active on a blocked proposal",
+                denied(lambda: decG(ga, "authorize", state_version=vA_["state_version"] - 1), "STALE_VIEW")
+                and denied(lambda: decG(ga, "authorize", proposal_sha256="0" * 64), "HASH_MISMATCH")
+                and denied(lambda: decG(ga, "authorize", nonce="f" * 32), "NONCE_MISMATCH"))
+            oRv = decG(ga, "revise")
+            oRj = decG(g2, "reject")
+            chk("GT 7 Revise / Reject (Cancel) remain available on a blocked proposal",
+                oRv.get("state") == "PROPOSED" and stG.get(ga)["authority"] is None
+                and oRj.get("state") == "REJECTED" and stG.get(g2)["authority"] is None
+                and denied(lambda: decG(g2, "authorize", nonce=nonce2, state_version=sv2)))
+            eG.transport = good_rt
+            clk.t += 2
+            g8 = eG.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="probe_on")["txn_id"]
+            r8 = stG.get(g8)
+            rv8 = eG.apply_envelope(env("revise", g8, base_state_version=r8["state_version"],
+                                        proposal=dict(r8["proposal"], value={"state": "off"})))
+            r8b = stG.get(g8)
+            den8 = denied(lambda: decG(g8, "authorize"), "REVIEW_NOT_BOUND")
+            eG.design_check(g8)
+            r8c = stG.get(g8)
+            o8 = decG(g8, "reject")
+            chk("GT 8 material revision -> old review cleared, fresh review required; then fresh authority possible",
+                r8["design_review"]["status"] == "RECEIVED" and rv8.get("state") == "AWAITING_AUTHORITY"
+                and r8b["design_review"] is None and r8b["authority"] is None and r8b["package_digest"] != r8["package_digest"]
+                and den8 and r8c["design_review"]["status"] == "RECEIVED" and authority_review_ok(r8c)
+                and o8.get("state") == "REJECTED")
+            eG.transport = badbind_rt
+            clk.t += 2
+            g9 = eG.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="read_sun")["txn_id"]
+            hc9 = len(HCALLS)
+            r9 = stG.get(g9)
+            c9 = hV2._converse(r9, vG(g9), True, ".") if False else None
+            hG = Handler.__new__(Handler)
+            hG.engine, hG.cred, hG.att, hG.headers = eG, _CredStub(), {"attestation": "MATCH", "private_source_commit": "e" * 40}, {}
+            card9 = hG._converse(r9, vG(g9), True, ".")
+            o9 = decG(g9, "authorize")
+            eG.transport = good_rt
+            eG.api_execute(g9, transport=mk("anthropic"))
+            chk("GT 9 read-only + unbound review is NOT hard-blocked (accepted read policy), but disclosed as unconfirmed",
+                r9["design_review"]["status"] == "REVIEW_BINDING_MISMATCH" and authority_review_ok(r9)
+                and 'value="authorize"' in card9 and "could not be confirmed" in txt(card9) and "found no problems" not in txt(card9)
+                and o9.get("state") == "DISPATCHED" and HCALLS[hc9:] == [("GET", "/states/sun.sun")])
+            eG.transport = badbind_rt
+            clk.t += 2
+            g10 = eG.owner_ask(peer=INGRESS_GATEWAY, remote_user_id=OWNER, text="Turn the GAOP test switch off")["txn_id"]
+            eG.transport = good_rt
+            clk.t += 2
+            g11 = eG.owner_ask(peer=INGRESS_GATEWAY, remote_user_id=OWNER, text="Turn the GAOP test switch on")["txn_id"]
+            cb = hG._converse(stG.get(g10), vG(g10), True, ".")
+            cg = hG._converse(stG.get(g11), vG(g11), True, ".")
+            home = hG._home(True)
+            sysp = hG._panel(True)
+            sys_cards = sysp.split('<div class="card">')
+            sb = [c for c in sys_cards if g10 in c][0]
+            sg = [c for c in sys_cards if g11 in c][0]
+            chk("GT 10 UI: blocked change says it won't run and offers only Reject/Cancel + Revise; clean change offers Authorize",
+                "check against this exact plan, so I won" in txt(cb) and 'value="authorize"' not in cb
+                and 'value="reject"' in cb and 'value="revise"' in cb and "Nothing happens until you press" not in txt(cb)
+                and "found no problems" in txt(cg) and 'value="authorize"' in cg)
+            chk("GT 11 System page: technical reason shown, Authorize absent for the blocked change only; no secrets",
+                "Authorize unavailable" in sb and "REVIEW_BINDING_MISMATCH" in sb and 'value="authorize"' not in sb
+                and 'value="authorize"' in sg and "Authorize unavailable" not in sg and KEY_A not in sysp and KEY_O not in sysp)
+            chk("GT 12 no acknowledgement bypass anywhere (no checkbox / proceed-anyway control on either page)",
+                'type="checkbox"' not in home and "anyway" not in home.lower() and "anyway" not in sysp.lower()
+                and "override" not in home.lower() and "override" not in sysp.lower())
 
             # --- unsupported newer store schema fails closed ---
             m = os.path.join(td, "gaop", "meta.json")

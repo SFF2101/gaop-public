@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.11 (DAI-IN-526 consequential authorization gate: unbound/unavailable ChatGPT review)
+- Authorize for a consequential Home Assistant operation (any `ha.*` op other than the read-only `ha.state.read`) is
+  refused at the single authority point (`owner_decision`) with `REVIEW_NOT_BOUND` unless the ChatGPT design review
+  is bound to the exact current package: `design_review.status == RECEIVED` and `verdict == NO_OBJECTION`. The verdict
+  alone is not sufficient. The check runs before any authority record, nonce use, provider dispatch or HA call;
+  stale-view, hash, nonce, revision, expiry and replay controls are unchanged and still independently active.
+- Read-only and synthetic operations keep the accepted proportionate policy (not hard-blocked; unbound reviews are disclosed).
+- Home: a blocked change says "I couldn't confirm ChatGPT's check against this exact plan, so I won't let this change
+  run yet." and offers Revise / Reject (Cancel) only. System & Maintenance shows the technical review status. No
+  acknowledgement checkbox or override exists. No re-check action is offered (none exists); a revised consequential
+  proposal stays blocked until it is rejected and asked again.
+- Selftest 255 checks (243 prior unchanged + 12 new GT checks). Test fixtures now run the real design check before
+  authorizing consequential operations, matching production.
+
 ## 0.8.10 (DAI-IN-525 live-verification fixes to the Home page; presentation only)
 - The ChatGPT plan check runs in the background after Ask. Until it is back (max 60 s), the Home card now says
   "ChatGPT is checking this plan…", shows no decision buttons (they would be refused as stale) and the page refreshes
