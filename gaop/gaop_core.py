@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAOP v0.8.7 — production dual-AI build (+ DAI-IN-515 Dashboard budget profiles, DAI-IN-518 HA-path metering) (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
+"""GAOP v0.8.8 — production dual-AI build (+ DAI-IN-524 production Dashboard UX) (+ DAI-IN-515 Dashboard budget profiles, DAI-IN-518 HA-path metering) (+ DAI-IN-512 P1 real-HA targets) (DAI-IN-509): control plane core.
 
 Single stdlib-only module. Roles (repository-role invariant):
   GitHub private repo = source; gaop-public = generated secret-free distribution;
@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time, types
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.7"
+VERSION = "0.8.8"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -360,6 +360,17 @@ def budget_profile_name(b):
 
 def budget_text(b):
     return " · ".join("%s %s" % (k, b[k]) for k in BUDGET_KEYS if k in (b or {}))
+
+
+# v0.8.8 (DAI-IN-524): production-facing display labels only. Internal profile names, values and
+# resolution are unchanged; the label never reaches proposals, packages, digests or receipts.
+DASHBOARD_PROFILE_LABELS = types.MappingProxyType({"standard": "standard", "pilot_bounded": "bounded"})
+
+
+def budget_profile_label(b):
+    """Display only: production-facing label for the profile whose resolved values equal b."""
+    n = budget_profile_name(b)
+    return DASHBOARD_PROFILE_LABELS.get(n, n)
 
 
 def build_exec_package(txn_id, revision, p, expires_at, pkg_nonce):
@@ -1518,8 +1529,10 @@ class Engine:
         return self._verify(txn_id)
 
     def owner_pilot_request(self, *, peer, remote_user_id, kind, budget_profile=PILOT_BUDGET_PROFILE):
-        """Owner-only Dashboard entry for the two P1 real-HA Pilot targets. Proposal only, not authority.
-        Always uses the exact pilot_bounded budget profile (any other selection fails closed; never standard)."""
+        """Owner-only Dashboard entry for the two allowlisted real-HA targets ("Home Assistant actions";
+        the probe kinds are offered only in the diagnostics view). Proposal only, not authority.
+        Always uses the exact pilot_bounded budget profile (any other selection fails closed; never standard).
+        v0.8.8: new transaction IDs use the production prefix TXN-HA-DB-; historical TXN-P1-* IDs are untouched."""
         if peer != INGRESS_GATEWAY:
             raise Denied("NOT_INGRESS_GATEWAY", peer)
         if not remote_user_id or sha((OWNER_PIN_PREFIX + remote_user_id).encode()) != OWNER_PIN:
@@ -1535,10 +1548,10 @@ class Engine:
                    "openai-api reviews it" % kind[6:])
         else:
             raise Denied("MALFORMED", "kind")
-        txn = "TXN-P1-DB-" + time.strftime("%Y%m%d%H%M%S", time.gmtime(self.clock()))
+        txn = "TXN-HA-DB-" + time.strftime("%Y%m%d%H%M%S", time.gmtime(self.clock()))
         p = {"op": op, "target": HA_OP_TARGETS[op], "value": value,
              "scope": "exactly one allowlisted Home Assistant entity; no other entity or service",
-             "effect": eff, "summary": "Dashboard P1 real-HA Pilot-target request", "ttl_seconds": 1800,
+             "effect": eff, "summary": "Dashboard Home Assistant action request", "ttl_seconds": 1800,
              "route": "claude-api", "review_route": "openai-api", "evidence": "none", "budgets": budgets}
         env = json.dumps({"protocol": PROTOCOL, "op": "propose", "txn_id": txn, "role": "designer",
                           "envelope_id": "dash-" + txn, "proposal": p,
@@ -2557,7 +2570,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "NOT_INGRESS_GATEWAY"})
         try:
             if path == "/":
-                return self._send(200, self._panel(owner), "text/html")
+                q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+                return self._send(200, self._panel(owner, diagnostics=(q.get("diagnostics") or [""])[0] == "1"),
+                                  "text/html")
             m = re.match(r"^/api/(txn|pkg|receipt|live)/(TXN-[A-Z0-9-]+)$", path)
             if m:
                 kind, t = m.groups()
@@ -2633,7 +2648,7 @@ class Handler(BaseHTTPRequestHandler):
                                                       budget_profile=g("budget_profile") or PILOT_BUDGET_PROFILE)
                 log("REQUEST dashboard-owner P1 -> %s" % json.dumps(out, sort_keys=True))
                 return self._send(200 if out.get("outcome") == "ACCEPTED" else 409,
-                                  self._panel(owner, notice="P1 request: %s %s" % (out.get("txn_id", ""), out.get("state") or out.get("code"))), "text/html")
+                                  self._panel(owner, notice="request: %s %s" % (out.get("txn_id", ""), out.get("state") or out.get("code"))), "text/html")
             if path in ("/setup/provider", "/setup/provider_delete"):
                 if peer != INGRESS_GATEWAY or not owner:
                     raise Denied("NOT_OWNER", "setup is owner-only")
@@ -2682,8 +2697,11 @@ class Handler(BaseHTTPRequestHandler):
         b = self.headers.get("X-Ingress-Path", "")
         return b if re.match(r"^/api/hassio_ingress/[A-Za-z0-9_-]{8,128}$", b) else "."
 
-    def _panel(self, owner, notice=""):
+    def _panel(self, owner, notice="", diagnostics=False):
+        """Owner/read-only panel. v0.8.8: test/diagnostic scaffolding (synthetic request, probe buttons) is shown
+        only in the explicit owner diagnostics view (?diagnostics=1); the normal view is production-facing."""
         e = self.engine
+        diag = bool(owner and diagnostics)
         base = esc(self._base())
         rows = []
         for t in e.s.active():
@@ -2749,7 +2767,7 @@ class Handler(BaseHTTPRequestHandler):
                    esc(p.get("evidence", "none")),
                    esc(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(v["expires_at"]))),
                    esc(v["revision"]), esc(v["proposal_sha256"]),
-                   esc(budget_profile_name(v.get("package_budgets"))), esc(budget_text(v.get("package_budgets"))),
+                   esc(budget_profile_label(v.get("package_budgets"))), esc(budget_text(v.get("package_budgets"))),
                    extra + form))
         recent = []
         for t in reversed(e.s.recent()):
@@ -2767,12 +2785,15 @@ class Handler(BaseHTTPRequestHandler):
                     '<td>Result</td><td>Route</td><td>Evidence</td><td>Receipt</td></tr>%s</table></div>'
                     % "".join(recent)) if recent else ""
         req = ""
-        if owner:
+        if diag:
+            req = ('<p class="n">Diagnostics view: test and recovery tools. <a href="%s/">Return to normal view</a></p>'
+                   % base)
+        if diag:
             ps = provider_status(e.s)
             opts_r = "".join('<option value="%s">%s (%s)</option>' % (r, r, esc(ps[r]["model"]))
                              for r in PROVIDERS if ps[r]["configured"] and r in EXECUTOR_ROUTES)
             if opts_r:
-                req = ('<div class="card"><h3>New synthetic request</h3><form method="post" action="%s/request">'
+                req += ('<div class="card"><h3>New synthetic request</h3><form method="post" action="%s/request">'
                        '<input name="value" placeholder="synthetic value to echo" size="40" maxlength="80"> '
                        '<select name="route">%s</select> '
                        '<label><input type="checkbox" name="evidence" value="drive" checked> Drive evidence</label> '
@@ -2780,18 +2801,21 @@ class Handler(BaseHTTPRequestHandler):
                        '<button>Create proposal</button></form><p class="st">Creates a proposal and asks ChatGPT (openai-api: %s) '
                        'to problem-check it. Claude executes only after you press Authorize; ChatGPT then reviews the result.</p></div>'
                        % (base, opts_r, "".join('<option value="%s"%s>budget: %s</option>'
-                                                % (n, " selected" if n == DASHBOARD_DEFAULT_PROFILE else "", n)
+                                                % (n, " selected" if n == DASHBOARD_DEFAULT_PROFILE else "",
+                                                   DASHBOARD_PROFILE_LABELS.get(n, n))
                                                 for n in DASHBOARD_BUDGET_PROFILES),
                           "configured" if ps["openai-api"]["configured"] else "NOT configured — results will be PARTIAL"))
         if owner and provider_status(e.s)["claude-api"]["configured"]:
-            req += ('<div class="card"><h3>P1 real-HA Pilot targets</h3><form method="post" action="%s/pilot_request">'
+            req += ('<div class="card"><h3>Home Assistant actions</h3><form method="post" action="%s/pilot_request">'
                     '<input type="hidden" name="budget_profile" value="%s">'
-                    '<button name="kind" value="read_sun">Read sun.sun</button> '
-                    '<button name="kind" value="probe_on">Set gaop_pilot_probe ON</button> '
-                    '<button name="kind" value="probe_off">Set gaop_pilot_probe OFF</button></form>'
+                    '<button name="kind" value="read_sun">Read sun.sun</button> %s</form>'
                     '<p class="st">Creates a proposal only (exactly one allowlisted entity). It runs after you press '
-                    'Authorize on its card. Budget profile: <b>%s</b> (%s).</p></div>'
-                    % (base, PILOT_BUDGET_PROFILE, PILOT_BUDGET_PROFILE, esc(budget_text(resolve_budget_profile(PILOT_BUDGET_PROFILE)))))
+                    'Authorize on its card. Budget limits: <b>%s</b> (%s).</p></div>'
+                    % (base, PILOT_BUDGET_PROFILE,
+                       ('<button name="kind" value="probe_on">Set gaop_pilot_probe ON</button> '
+                        '<button name="kind" value="probe_off">Set gaop_pilot_probe OFF</button>') if diag else "",
+                       esc(DASHBOARD_PROFILE_LABELS[PILOT_BUDGET_PROFILE]),
+                       esc(budget_text(resolve_budget_profile(PILOT_BUDGET_PROFILE)))))
         setup = ""
         if owner:
             ps = provider_status(e.s)
@@ -2834,6 +2858,8 @@ class Handler(BaseHTTPRequestHandler):
             setup += "</div>"
         a = self.att or {}
         setup = req + rec_html + setup
+        if owner and not diag:
+            setup += ('<p class="st"><a href="%s/?diagnostics=1">Diagnostics</a> (test and recovery tools)</p>' % base)
         busy = any((e.s.get(t) or {}).get("state") not in (None, "AWAITING_AUTHORITY", "DISAGREEMENT", "DISPATCHED", "UNKNOWN_RECONCILE")
                    for t in e.s.active())
         hb = e.s.live_get().get("heartbeat_at")
@@ -4134,6 +4160,74 @@ def run_selftest():
                 and OPENAI_REVIEW_MODEL == "gpt-4.1")
             chk("HAM 13b HAClient without meter behaves as before (no budget side effects)",
                 HAClient(fha).get_state("sun.sun")["entity_id"] == "sun.sun")
+
+            # ================= v0.8.8 production Dashboard UX (DAI-IN-524) =================
+            # Fresh store/engine; mock reviewer/HA transports only. Panel rendered directly (no HTTP server).
+            stU = Store(os.path.join(td, "gaop88"))
+            save_provider_cred(stU, "claude-api", KEY_A, "")
+            save_provider_cred(stU, "openai-api", KEY_O, "test-model")
+            eU = Engine(stU, adapters={"mock-reviewer": mock_reviewer, "ha_client": HAClient(fha)}, clock=clk,
+                        transport=mk_review())
+            clk.t += 2
+            ru = eU.owner_pilot_request(peer=INGRESS_GATEWAY, remote_user_id=OWNER, kind="read_sun")
+            rU = stU.get(ru.get("txn_id")) or {}
+            chk("UX 5 new Dashboard HA action ID uses production prefix TXN-HA-DB-<UTC ts>, not TXN-P1",
+                re.match(r"^TXN-HA-DB-\d{14}$", ru.get("txn_id") or "") is not None and TXN_RE.match(ru["txn_id"])
+                and not ru["txn_id"].startswith("TXN-P1") and ru.get("state") == "AWAITING_AUTHORITY")
+            chk("UX 5 historical TXN-P1-* IDs remain valid and addressable (TXN_RE + /api route pattern)",
+                all(TXN_RE.match(x) and re.match(r"^/api/(txn|pkg|receipt|live)/(TXN-[A-Z0-9-]+)$", "/api/receipt/" + x)
+                    for x in ("TXN-P1-DB-20261009062417", "TXN-P1-DB-20261007201912", "TXN-08-DB-20261007143902")))
+            chk("UX 4/5 semantics preserved: pilot_bounded limits bound, operation identity independent of new summary",
+                rU["proposal"]["budgets"] == rU["exec_package"]["budgets"] == rU["budget"]["limits"] == PB
+                and rU["proposal"]["summary"] == "Dashboard Home Assistant action request"
+                and rU["operation_id"] == operation_identity(dict(rU["proposal"], summary="Dashboard P1 real-HA Pilot-target request"))
+                and rU["proposal"]["route"] == "claude-api" and rU["proposal"]["review_route"] == "openai-api"
+                and rU["package_digest"] == package_digest(rU["exec_package"]) and rU["authority"] is None)
+            chk("UX 4 production label only: label(pilot_bounded)=bounded; internal name/values unchanged",
+                budget_profile_label(PB) == "bounded" and budget_profile_label(BUDGET_DEFAULT) == "standard"
+                and budget_profile_name(PB) == "pilot_bounded" and resolve_budget_profile("pilot_bounded") == PB
+                and PILOT_BUDGET_PROFILE == "pilot_bounded" and isinstance(DASHBOARD_PROFILE_LABELS, types.MappingProxyType))
+
+            class _CredStub:
+                def status(self):
+                    return {"client_configured": True, "token_present": True, "scope": "drive.file"}
+            hU = Handler.__new__(Handler)
+            hU.engine, hU.cred, hU.att, hU.headers = eU, _CredStub(), {"attestation": "MATCH", "private_source_commit": "c" * 40}, {}
+
+            def txt(html):
+                return re.sub(r"\s+", " ", re.sub(r"<[^>]*>", " ", html))
+            pn, pd, pr = hU._panel(True), hU._panel(True, diagnostics=True), hU._panel(False, diagnostics=True)
+            tn = txt(pn)
+            chk("UX 1/4 normal owner view: no user-facing P1 / Pilot / pilot_bounded wording",
+                all(w not in tn for w in ("P1", "Pilot", "pilot_bounded", "pilot")))
+            chk("UX 2 normal owner view: production heading + Read sun.sun; old pilot heading gone",
+                "Home Assistant actions" in pn and 'value="read_sun"' in pn and "real-HA Pilot targets" not in pn)
+            chk("UX 3/6 normal owner view: no probe buttons and no synthetic request; diagnostics link only",
+                "probe_on" not in pn and "probe_off" not in pn and "gaop_pilot_probe" not in pn
+                and "New synthetic request" not in pn and "/request\"" not in pn and "?diagnostics=1" in pn)
+            chk("UX 3/6 diagnostics owner view retains probe buttons + synthetic request (capability kept)",
+                'value="probe_on"' in pd and 'value="probe_off"' in pd and "New synthetic request" in pd
+                and "Diagnostics view" in pd and "budget: bounded" in pd and 'value="pilot_bounded"' in pd)
+            chk("UX 3/6 non-owner cannot open diagnostics (no forms rendered)",
+                "<form" not in pr and "New synthetic request" not in pr and "probe_on" not in pr)
+            chk("UX 4/7 active card: Authorize/Reject/Revise + bound limits shown with production label",
+                'value="authorize"' in pn and 'value="reject"' in pn and 'value="revise"' in pn
+                and ("bounded: " + budget_text(PB)) in tn and ru["txn_id"] in pn)
+            chk("UX 8 attestation/version/heartbeat line preserved",
+                ("v%s · attestation MATCH · source %s" % (VERSION, "c" * 12)) in pn and "heartbeat" in pn)
+            authU = eU.owner_decision(peer=INGRESS_GATEWAY, remote_user_id=OWNER, txn_id=ru["txn_id"],
+                                      proposal_sha256=eU.view(ru["txn_id"], owner=True)["proposal_sha256"],
+                                      state_version=eU.view(ru["txn_id"], owner=True)["state_version"],
+                                      nonce=eU.view(ru["txn_id"], owner=True).get("pending_nonce") or "", decision="authorize")
+            nU = len(HCALLS)
+            eU.api_execute(ru["txn_id"], transport=mk("anthropic"))
+            rU = stU.get(ru["txn_id"])
+            pn2 = hU._panel(True)
+            chk("UX 7/9 normal workflow end-to-end under new ID: COMPLETED, one GET sun.sun, receipt bound, in Recent results",
+                authU.get("state") == "DISPATCHED" and rU["state"] == "COMPLETED" and HCALLS[nU:] == [("GET", "/states/sun.sun")]
+                and rU["receipt"]["txn_id"] == ru["txn_id"] and rU["receipt"]["budget_limits"] == PB
+                and rU["receipt"]["authority_package_digest"] == rU["package_digest"]
+                and "Recent results" in pn2 and ru["txn_id"] in pn2)
 
             # --- unsupported newer store schema fails closed ---
             m = os.path.join(td, "gaop", "meta.json")

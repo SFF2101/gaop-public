@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.8 (DAI-IN-524 final pre-go-live production Dashboard UX refinement)
+- Normal owner view: heading "P1 real-HA Pilot targets" → "Home Assistant actions" (Read sun.sun only); budget
+  limits shown with the production label `bounded` (display only — internal profile `pilot_bounded`, its values,
+  proposal/package/digest/receipt content unchanged); post-request notice no longer says "P1".
+- Synthetic request card and the `gaop_pilot_probe` ON/OFF buttons moved to an explicit owner-only Diagnostics view
+  (`?diagnostics=1`, linked at the bottom of the owner panel). Capabilities and server routes unchanged.
+- New Dashboard Home Assistant action transactions use `TXN-HA-DB-<UTC yyyymmddHHMMSS>` (was `TXN-P1-DB-`); proposal
+  summary "Dashboard Home Assistant action request". Historical `TXN-P1-*` IDs/records untouched. Operation
+  identity (R2) excludes the summary and transaction ID, so duplicate/replay protection is unchanged.
+- Unchanged: authority binding, routes/providers/models (gpt-4.1 pin, prompts), budgets/profiles/accounting,
+  receipts, HA call table/targets, attestation/heartbeat, permissions, store schema, protocol.
+  Selftest 219 checks (207 prior unchanged + 12 new UX checks).
+
 ## 0.8.7 (DAI-IN-518 HA-path budget metering — production defect fix)
 - Fix: on the Dashboard/claude-api Home Assistant path (`Engine._ha_execute` → `HAClient`), GAOP's own HA Core requests
   were not charged to `tool_calls` or `retrieval_bytes`, so those two bound limits were inert there. Each attempted HA

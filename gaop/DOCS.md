@@ -1,5 +1,11 @@
 # GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
 
+**v0.8.8:** the normal owner Dashboard is production-facing: the read-only Home Assistant action ("Read
+sun.sun") sits under "Home Assistant actions"; the bounded budget profile is labelled `bounded` (internally still
+`pilot_bounded`, same limits); new Dashboard Home Assistant action transactions are named `TXN-HA-DB-<UTC time>`
+(historical `TXN-P1-*` IDs are unchanged). The synthetic request and the `gaop_pilot_probe` ON/OFF buttons are
+in the owner-only Diagnostics view (link at the bottom of the panel, `?diagnostics=1`).
+
 **v0.8.7:** every Home Assistant request GAOP makes for a transaction counts as one `tool_call`, and its
 response bytes count toward `retrieval_bytes`; both limits are enforced before the next request.
 
