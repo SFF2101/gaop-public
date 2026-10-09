@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.9 (DAI-IN-525 two-page hobby-friendly conversational Dashboard)
+- Page 1 "GAOP" (`/`): "What would you like me to do?" text box + Ask, plain-language replies, and one conversational
+  card per transaction with the existing Authorize / Revise / Reject (Cancel) controls directly underneath; plain-language
+  success/failure wording (STOP / PARTIAL / UNKNOWN_RECONCILE / REJECTED are never shown as success); a Details link to the
+  existing read-only transaction/receipt view. No model names, IDs, hashes or budget counters on this page.
+- Page 2 "System & Maintenance" (`/system`): the previous panel unchanged in substance (version/attestation/heartbeat,
+  active transaction detail, Home Assistant actions, Recent results with transaction/receipt links, provider setup,
+  Diagnostics view at `/system?diagnostics=1`), plus a Home link.
+- Conversational intake (`POST /ask`, owner only): `compile_ask()` is a closed deterministic allowlist that maps prose to
+  exactly one existing request kind (read sun.sun / test switch on / test switch off) or replies with a clarification or
+  "can't do that". It never calls a provider, never infers other targets, and never carries authority; the compiled
+  request goes through `owner_pilot_request` (same proposal, design check, owner Authorize, execution and receipt). The
+  prose is kept only for display (`ask_text`), not in the proposal, package, provider prompts or receipt.
+- Unchanged: authority / stale-view / nonce / revision semantics, package binding, routes, providers and models,
+  credentials, budgets and accounting, deterministic verification, R1/R2/R3, receipt schema, attestation, HA allowlist.
+  Selftest 239 checks (219 prior unchanged + 20 new).
+
 ## 0.8.8 (DAI-IN-524 final pre-go-live production Dashboard UX refinement)
 - Normal owner view: heading "P1 real-HA Pilot targets" → "Home Assistant actions" (Read sun.sun only); budget
   limits shown with the production label `bounded` (display only — internal profile `pilot_bounded`, its values,

@@ -1,5 +1,12 @@
 # GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
 
+**v0.8.9:** two pages. **Home** (the panel's first page) is a simple "What would you like me to do?" box: GAOP
+replies in plain language, and anything it would do appears as a short proposal with Authorize / Revise /
+Reject (Cancel) underneath; nothing runs until you press Authorize. Today it understands: whether the sun is up
+(sun.sun), and turning the GAOP test switch (input_boolean.gaop_pilot_probe) on or off; anything else gets a
+clarification or "I can't do that yet". **System & Maintenance** (link at the bottom of Home) holds the technical
+view: version/attestation/heartbeat, transaction and receipt detail, provider setup and the Diagnostics tools.
+
 **v0.8.8:** the normal owner Dashboard is production-facing: the read-only Home Assistant action ("Read
 sun.sun") sits under "Home Assistant actions"; the bounded budget profile is labelled `bounded` (internally still
 `pilot_bounded`, same limits); new Dashboard Home Assistant action transactions are named `TXN-HA-DB-<UTC time>`
