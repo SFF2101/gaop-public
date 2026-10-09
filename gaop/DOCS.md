@@ -1,5 +1,10 @@
 # GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
 
+**v0.8.12:** a proposal may carry an optional, bounded `evidence_manifest` of immutable source references with exact
+excerpts. GAOP verifies them itself (attested release files, or canonical documents admitted through the self-verifying
+`/evidence` ingress), binds them into what you authorize, and gives them to ChatGPT's checks. Nothing changes for
+transactions without evidence; the Home and System pages are unchanged.
+
 **v0.8.11:** a consequential change (e.g. turning the GAOP test switch on/off) can only be authorized when
 ChatGPT's plan check is confirmed against that exact plan. If it is unbound, unavailable or missing, Home says
 "I couldn't confirm ChatGPT's check against this exact plan, so I won't let this change run yet." and offers only

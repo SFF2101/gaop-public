@@ -1,14 +1,14 @@
 {
- "gaop_version": "0.8.11",
- "package_digest": "630cd28acc121195783af4c3072b494d476131f09ff4b9f60e655c51cfa914fd",
+ "gaop_version": "0.8.12",
+ "package_digest": "44bc29a5aeddc242b53e234caed86135985776d147044e00b85180026a01ee05",
  "previous_release": {
-  "gaop_version": "0.8.10",
-  "private_source_commit": "0937955dd4406d3403a41aa835df9f9ef46bbbcc",
-  "public_main": "24fd4ce32d35d9c540d459fe9d31138c7d4c1196"
+  "gaop_version": "0.8.11",
+  "private_source_commit": "7822b469cbe2ad8b722f3d8e7f551b5fa56e03b6",
+  "public_main": "50cc9bd22ab0729d3c219e266834233b08f6e01a"
  },
- "private_source_commit": "7822b469cbe2ad8b722f3d8e7f551b5fa56e03b6",
- "public_distribution_commit": "recorded after merge (see git history / DAI-OUT-526)",
+ "private_source_commit": "cf9c36505c0f8f70d38174ca98d44c1a9642d005",
+ "public_distribution_commit": "recorded after merge (see git history / release report)",
  "release_manifest": "gaop/GAOP_RELEASE.json",
- "rollback_target": "public commit 24fd4ce32d35d9c540d459fe9d31138c7d4c1196 (GAOP 0.8.10); accepted baseline 0.8.8 = 1a965c2a2ca1f4084a111b744c849ef905fb6478",
+ "rollback_target": "public commit 50cc9bd22ab0729d3c219e266834233b08f6e01a (GAOP 0.8.11); accepted baseline 0.8.8 = 1a965c2a2ca1f4084a111b744c849ef905fb6478",
  "schema": "gaop.publication.v1"
 }
