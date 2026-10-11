@@ -6,7 +6,7 @@
   "private_source_commit": "7822b469cbe2ad8b722f3d8e7f551b5fa56e03b6",
   "public_main": "50cc9bd22ab0729d3c219e266834233b08f6e01a"
  },
- "private_source_commit": "cf9c36505c0f8f70d38174ca98d44c1a9642d005",
+ "private_source_commit": "9ac14ae570112f9e8d13d4a5295722e13eca8f24",
  "public_distribution_commit": "recorded after merge (see git history / release report)",
  "release_manifest": "gaop/GAOP_RELEASE.json",
  "rollback_target": "public commit 50cc9bd22ab0729d3c219e266834233b08f6e01a (GAOP 0.8.11); accepted baseline 0.8.8 = 1a965c2a2ca1f4084a111b744c849ef905fb6478",
