@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.12 (DAI-IN-527 Step 1 immutable technical-evidence binding; PR #35, merge 6298337d)
+- Optional proposal field `evidence_manifest`: up to 3 immutable references (repo, path, full commit, git blob, SHA-256,
+  provenance) with exact line excerpts (≤2 per entry, ≤40 lines / ≤800 chars each, ≤1600 chars total). GAOP verifies
+  every entry itself before the proposal is persisted and again immediately before owner authority; mutable refs,
+  unknown/unauthorized sources, forged identities, hash or excerpt mismatches and oversize evidence are refused.
+- Sources: `attested-release` (GAOP's own attested runtime files) and `canonical-git` (canonical `governance/` and `gaop/`
+  documents admitted through the bounded, self-verifying `POST /evidence` ingress: raw git objects anchored at the attested
+  release commit, ancestors only). No GitHub access or credential at any stage.
+- Verified evidence is bound into the proposal hash and package digest (any change invalidates authority), is delivered to
+  the OpenAI design check and post-execution review (delivered digest recorded and required), and receipts record
+  identities and delivered digests only, never excerpts.
+- Transactions without an evidence manifest are unchanged. Independent verification: 273/273.
+
 ## 0.8.11 (DAI-IN-526 consequential authorization gate: unbound/unavailable ChatGPT review)
 - Authorize for a consequential Home Assistant operation (any `ha.*` op other than the read-only `ha.state.read`) is
   refused at the single authority point (`owner_decision`) with `REVIEW_NOT_BOUND` unless the ChatGPT design review
