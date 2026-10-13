@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time, types
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.12"
+VERSION = "0.8.13"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -56,6 +56,8 @@ ENVELOPE_OPS = {"propose", "revise", "cancel", "claim", "begin", "result", "reco
 FORBIDDEN_KEYS = {"authority", "authorized", "authorize", "authorization", "approval", "approve",
                   "approved", "owner", "owner_pin", "auth_nonce", "nonce"}
 TERMINAL = {"COMPLETED", "REJECTED", "CANCELLED", "EXPIRED", "DENIED", "STOP", "PARTIAL"}
+# DAI-IN-533: pre-authority states that only wait for the owner; once expires_at passes they settle EXPIRED
+PENDING_UNAUTHORISED = ("PROPOSED", "AWAITING_AUTHORITY", "DISAGREEMENT")
 STATES = ["PROPOSED", "AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCH_PENDING", "DISPATCHED",
           "CLAIMED", "RUNNING", "RESULT_PERSISTED", "VERIFIED", "REVIEWING", "COMPLETED",
           "REJECTED", "CANCELLED", "EXPIRED", "DENIED", "STOP", "PARTIAL", "DISAGREEMENT",
@@ -649,6 +651,10 @@ def verify_canonical_bundle(bundle, anchor_repo, anchor_commit):
 # and never carries authority: the compiled kind is submitted through owner_pilot_request (same proposal,
 # design check, owner Authorize and execution path). The prose itself is never sent to any provider.
 ASK_MAX_CHARS = 300
+# DAI-IN-534: owner approval window for synthetic Dashboard proposals. Applies ONLY before authority exists; the
+# accepted proposal/authority/package/execution deadline (ttl_seconds 1800) is unchanged, so on-time approval leaves
+# >= 1200 s of execution validity (covers the accepted 600 s / 900 s elapsed budgets). HA-action requests: no window.
+DASHBOARD_SYNTHETIC_APPROVAL_S = 600
 CHECK_WAIT_S = 60          # v0.8.10: max time Home withholds decision buttons while the plan check is pending
 ASK_ENTITY_RE = re.compile(r"\b[a-z_]+\.[a-z0-9_]{2,}\b")
 ASK_ALLOWED_ENTITIES = frozenset({"sun.sun", "input_boolean.gaop_pilot_probe"})
@@ -1425,11 +1431,29 @@ class Engine:
             raise Denied("WRONG_STATE", rec["state"])
         return rec
 
+    @staticmethod
+    def _pending_unauthorised(rec):
+        """DAI-IN-533/534: waiting only for the owner; never authorised, nothing executed."""
+        return (rec["state"] in PENDING_UNAUTHORISED and not rec.get("authority") and not rec.get("authority_use")
+                and not rec.get("execution") and not rec.get("result"))
+
+    @staticmethod
+    def _approval_deadline(rec):
+        """Owner approval deadline: the optional approval window, never later than the accepted expires_at."""
+        a = rec.get("approval_expires_at")
+        return min(rec["expires_at"], a) if a is not None else rec["expires_at"]
+
     def _expire(self, rec):
-        if rec["state"] in ("AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCH_PENDING", "DISPATCHED", "DISAGREEMENT") \
-                and self.clock() > rec["expires_at"]:
+        # DAI-IN-533: residual PROPOSED (owner Revise) now expires like every other pre-execution state
+        # DAI-IN-534: pending never-authorised records use the approval deadline; once authorised, the accepted
+        # expires_at (bound into authority and package) is the only deadline, exactly as in v0.8.12
+        if rec["state"] not in ("PROPOSED", "AWAITING_AUTHORITY", "AUTHORIZED", "DISPATCH_PENDING", "DISPATCHED", "DISAGREEMENT"):
+            return
+        pending = self._pending_unauthorised(rec)
+        if self.clock() > (self._approval_deadline(rec) if pending else rec["expires_at"]):
             v = rec["state_version"]
-            self._tr(rec, "EXPIRED", "expiry reached before execution")
+            self._tr(rec, "EXPIRED", "approval window elapsed before authority" if pending
+                     else "expiry reached before execution")
             rec["authority"] = None
             self.s.put(rec, v)
             raise Denied("EXPIRED", rec["txn_id"])
@@ -1555,6 +1579,8 @@ class Engine:
         rec["proposal"] = p
         rec["proposal_sha256"] = proposal_hash(rec["txn_id"], rec["revision"], p)
         rec["expires_at"] = self.clock() + p["ttl_seconds"]
+        if rec.get("approval_window_s"):                 # DAI-IN-534: fresh owner approval window per revision
+            rec["approval_expires_at"] = self.clock() + rec["approval_window_s"]
         if rec["pending_nonce"]:
             rec["used_nonces"].append(rec["pending_nonce"])
         rec["pending_nonce"] = secrets.token_hex(16)
@@ -2057,6 +2083,8 @@ class Engine:
             try:
                 rec = self.s.get(txn)
                 rec["origin"] = "dashboard-owner-request"
+                rec["approval_window_s"] = DASHBOARD_SYNTHETIC_APPROVAL_S
+                rec["approval_expires_at"] = rec["created"] + DASHBOARD_SYNTHETIC_APPROVAL_S
                 self.s.put(rec, rec["state_version"])
             finally:
                 self.s.unlock()
@@ -2685,6 +2713,16 @@ class Engine:
                 rec = self.s.get(t)
                 if rec is None or rec["state"] in TERMINAL:
                     continue
+                if self._pending_unauthorised(rec) and rec.get("expires_at") is not None \
+                        and self.clock() > self._approval_deadline(rec):
+                    # DAI-IN-533: an elapsed, never-authorised pending proposal settles EXPIRED (existing terminal
+                    # state; CAS write under the store lock; history kept). Nothing was dispatched, so no retry.
+                    v = rec["state_version"]
+                    self._tr(rec, "EXPIRED", "approval window elapsed before authority")
+                    rec["authority"] = None
+                    self.s.put(rec, v)
+                    out.append((t, "EXPIRED"))
+                    continue
                 st, age = rec["state"], self.clock() - rec.get("stage_entered", rec.get("updated", self.clock()))
                 lim = STAGE_TIMEOUTS.get(st)
                 k = self._exhausted(rec) if rec["state"] not in ("AWAITING_AUTHORITY", "DISPATCHED", "DISAGREEMENT", "UNKNOWN_RECONCILE") else None
@@ -2749,6 +2787,7 @@ class Engine:
                                                  "response_id", "request_id", "correlation_id")} if pv else None
         v["result"] = (rec.get("result") or {}).get("result")
         v["origin"] = rec.get("origin")
+        v["approval_expires_at"] = rec.get("approval_expires_at")
         v["result_sha256"] = (rec.get("result") or {}).get("result_sha256")
         v["evidence_status"] = (rec.get("evidence") or {}).get("status")
         v["receipt_sha256"] = (rec.get("receipt") or {}).get("receipt_sha256")
@@ -3397,6 +3436,7 @@ class Handler(BaseHTTPRequestHandler):
                 latest = ""
         def _busy(r):
             return (r.get("state") not in (None, "AWAITING_AUTHORITY", "DISAGREEMENT", "DISPATCHED", "UNKNOWN_RECONCILE", "PROPOSED")
+                    + tuple(TERMINAL)
                     or (r.get("state") == "AWAITING_AUTHORITY" and not r.get("design_review")
                         and e.clock() - r.get("stage_entered", r.get("updated", e.clock())) < CHECK_WAIT_S + 2 * HEARTBEAT_SECONDS))
         busy = any(_busy(e.s.get(t) or {}) for t in e.s.active())
@@ -3461,7 +3501,9 @@ class Handler(BaseHTTPRequestHandler):
                 % (esc(v["txn_id"]), esc(v["state"]), esc(p["summary"]), esc(p["op"]), esc(p["target"]),
                    esc(json.dumps(p["value"])), esc(p["scope"]), esc(p["effect"]), esc(p["route"]),
                    esc(p.get("evidence", "none")),
-                   esc(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(v["expires_at"]))),
+                   esc(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(
+                       min(v["expires_at"], v["approval_expires_at"]) if v.get("approval_expires_at") is not None
+                       and v["state"] in PENDING_UNAUTHORISED else v["expires_at"]))),
                    esc(v["revision"]), esc(v["proposal_sha256"]),
                    esc(budget_profile_label(v.get("package_budgets"))), esc(budget_text(v.get("package_budgets"))),
                    extra + form))
@@ -3558,7 +3600,10 @@ class Handler(BaseHTTPRequestHandler):
         setup = req + rec_html + setup
         if owner and not diag:
             setup += ('<p class="st"><a href="%s/system?diagnostics=1">Diagnostics</a> (test and recovery tools)</p>' % base)
-        busy = any((e.s.get(t) or {}).get("state") not in (None, "AWAITING_AUTHORITY", "DISAGREEMENT", "DISPATCHED", "UNKNOWN_RECONCILE")
+        # DAI-IN-533: reload only while a transaction is genuinely progressing; a merely PROPOSED or terminal
+        # record left in active storage no longer makes System & Maintenance reload every heartbeat
+        busy = any((e.s.get(t) or {}).get("state") not in
+                   (None, "AWAITING_AUTHORITY", "DISAGREEMENT", "DISPATCHED", "UNKNOWN_RECONCILE", "PROPOSED") + tuple(TERMINAL)
                    for t in e.s.active())
         hb = e.s.live_get().get("heartbeat_at")
         refresh = ("<meta http-equiv='refresh' content='%d;url=%s/system'>" % (HEARTBEAT_SECONDS, base)) if busy else ""

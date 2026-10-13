@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.13 (DAI-IN-533/534 pending-proposal expiry, separate owner approval window, Dashboard refresh)
+- Pending proposals that were never authorised now expire with the existing EXPIRED terminal state, including a
+  residual PROPOSED record left by an owner Revise. The watchdog settles any elapsed, never-authorised pending
+  proposal (PROPOSED, AWAITING_AUTHORITY, DISAGREEMENT) as EXPIRED under the store lock with a CAS write and an
+  appended history entry; nothing is dispatched and nothing is retried. AUTHORIZED, DISPATCHED, CLAIMED, RUNNING
+  and UNKNOWN_RECONCILE transactions are not touched by this sweep.
+- Synthetic Dashboard requests get a separate 600 s owner approval window that applies only before authority
+  exists; a late Authorize is refused as EXPIRED with the nonce unconsumed. The accepted 1800 s proposal deadline
+  stays bound unchanged into authority, the execution package and dispatch, so timely approval keeps at least
+  1200 s of execution validity (covers the 600 s and 900 s elapsed budgets). A revision restarts the window.
+- Home Assistant action requests are unchanged (1800 s, no approval window). Records created before 0.8.13 behave
+  as before. No store schema change.
+- System & Maintenance no longer reloads every 5 s for PROPOSED or finished records; Home also ignores finished
+  records left in active storage. Genuinely progressing transactions still refresh every 5 s. The System panel
+  shows the approval deadline while a proposal is pending.
+- Verification: selftest 273/273 (check set unchanged); 24 focused offline tests in gaop/tests/test_dai533_expiry.py.
+
 ## 0.8.12 (DAI-IN-527 Step 1 immutable technical-evidence binding; PR #35, merge 6298337d)
 - Optional proposal field `evidence_manifest`: up to 3 immutable references (repo, path, full commit, git blob, SHA-256,
   provenance) with exact line excerpts (≤2 per entry, ≤40 lines / ≤800 chars each, ≤1600 chars total). GAOP verifies
