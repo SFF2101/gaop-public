@@ -1,4 +1,21 @@
-# GAOP — Governed AI Operations Platform (v0.8.x, dual-AI production build)
+# GAOP — Governed AI Operations Platform (v0.10.x, dual-AI production build)
+
+**v0.10.0:** ask GAOP anything about your home ("why does the porch light keep switching off?"). ChatGPT plans a few
+read-only checks; you see them and press Authorize; GAOP reads exactly those and ChatGPT answers from what was read. If
+a change would help, it is shown as a suggestion; "Prepare this change for my approval" makes it a separate proposal
+that ChatGPT checks and you Authorize. Allowed changes are listed under Capabilities on System & Maintenance; each one
+is read back after it is made. Automations may use any normal Home Assistant feature; before you Authorize, GAOP shows
+the complete configuration, a diff against the current one and the effects to note, and writes it only if the current
+configuration is unchanged. GAOP cannot prove what an automation will do when it runs: you approve exactly what is shown. GAOP alone talks to Home Assistant, through its existing access; the AI providers never do.
+
+**v0.9.0:** Home answers ordinary read-only questions about lights, switches, sensors (temperature, humidity, battery),
+doors and windows, covers, locks, climate, fans, the mower and the weather (`ha.query.read`). GAOP code turns the
+question into a small validated query (allowlisted domains, at most 20 entities, only entity, name, state, unit, device
+class, area and last-changed) and Home Assistant answers it through one read-only template that GAOP generates; you
+still press Authorize once, and nothing in your home changes. "Why…/investigate…" requests run the same way as a
+bounded read-only investigation. Change requests are refused unless a capability for them is registered (today: only
+the GAOP test switch). System & Maintenance lists the registered capabilities, keeps finished transactions under
+"Recent results" with frozen times, and shows only genuinely running or waiting work as active.
 
 **v0.8.12:** a proposal may carry an optional, bounded `evidence_manifest` of immutable source references with exact
 excerpts. GAOP verifies them itself (attested release files, or canonical documents admitted through the self-verifying
@@ -100,6 +117,9 @@ DENIED / STOP`, and `UNKNOWN_RECONCILE` (explicit resolution required).
 - Exact retrieval by stable ID only: `api/txn/<TXN>`, `api/pkg/<TXN>`, `api/receipt/<TXN>`,
   `api/attestation`. No list-all endpoint; no unrelated metadata disclosure. Packages ≤ 8 KiB with an
   integrity hash; truncation/partial package ⇒ STOP before mutation.
+- Also `api/live/<TXN>` (liveness; elapsed time frozen once the transaction has finished) and `api/identity`. All are
+  `GET` through the Supervisor ingress gateway only. `api/pkg/<TXN>` is served only while a transaction is DISPATCHED,
+  CLAIMED or RUNNING and is charged to its `retrieval_bytes` budget, so it is not a side-effect-free read; the others are.
 
 ## 6. Provider adapters (machine-addressable production routes)
 - **Standing setup vs per-transaction authority.** A provider API key is a one-time, owner-entered SETUP

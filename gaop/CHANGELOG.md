@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.10.0 (DAI-IN-537 governed tool orchestration; development candidate, not deployed)
+- New `ha.investigate` (read-only): for requests other than the fixed sun/test-switch paths, ChatGPT plans up to 6
+  read-only tool calls (state, template query, history, logbook, automation configuration). You see the plan and press
+  Authorize once; GAOP runs exactly that plan through its own fixed tool table; ChatGPT answers from the evidence and
+  may suggest an exact change. Values read from Home Assistant are treated as untrusted data.
+- New `ha.change` (consequential): "Prepare this change for my approval" turns a suggested change into a separate
+  proposal that needs ChatGPT's bound check and your own Authorize. Allowed: light/switch/fan/input_boolean/automation
+  turn_on|turn_off, cover open|close|stop, and writing one automation. Every change is read back; a refused change
+  stops cleanly, an uncertain one is never retried.
+- Automation boundary (DAI-IN-543): any normal Home Assistant automation is accepted (templates, variables, nested
+  triggers/conditions/actions, scripts, any integration's actions, blueprints); there is no action denylist. The
+  boundary is your approval of the exact configuration for one exact automation: the complete configuration (at most
+  12 KiB, refused explicitly if larger, never truncated), its digest, a diff against the current configuration, the
+  effects to note (actions, scripts, events, templates; noteworthy domains such as shell_command, lock or homeassistant
+  flagged) and what GAOP cannot know are shown before Authorize. An automation change must be the only call in its
+  change. It is prepared only if the investigation read the current configuration; GAOP writes only if that
+  configuration is unchanged (else STOP), sends exactly the approved configuration, keeps the previous configuration
+  verbatim for recovery and reads the result back. A read-back mismatch after writing is PARTIAL (no retry). Read-back
+  confirms the stored configuration, not the automation's behaviour when it triggers.
+- Capacity (DAI-IN-544): the former 2 KiB automation limit is removed. Configurations up to 12 KiB (canonical JSON) can
+  be suggested, shown, approved, written and read back; current configurations up to 16 KiB are read in full and
+  preserved for recovery. The limits follow the existing per-transaction ceilings (ChatGPT must write and review the
+  whole configuration within them); anything larger is refused with its size, never truncated. Change transactions use
+  the existing input/retrieval ceilings; in-process change proposals and tool packages may exceed the 4 KiB / 8 KiB
+  transport bounds, which still apply unchanged to /control, the option envelope and every pull-route package.
+- GAOP calls Home Assistant only through the App's existing Core API access; AI providers never call Home Assistant.
+  No new connector, credential or permission (config.yaml permissions unchanged).
+- Verification: selftest 273/273 (three pins amended to the new behaviour); DAI-533 24/24; DAI-536 22/22;
+  DAI-537 19/19 (two tests amended for DAI-IN-543); DAI-543 11/11 in gaop/tests/test_dai543_automation.py;
+  DAI-544 7/7 in gaop/tests/test_dai544_capacity.py (oversize fixtures in DAI-537/543 tests raised to the new limit).
+
+## 0.9.0 (DAI-IN-536 functional completion; development candidate, not deployed)
+- Dashboard: finished transactions (REJECTED, CANCELLED, EXPIRED, COMPLETED, STOP, PARTIAL, DENIED) are never shown as
+  active progress. Home shows current requests and the latest result; System & Maintenance shows "In progress or
+  waiting for you" and "Recent results" (history). A finished transaction's elapsed time is frozen when it finished.
+  Root cause of the stuck REJECTED card fixed: the active/recent index update now runs under its own lock (concurrent
+  unlocked writes could resurrect a finished ID). Records, receipts and store schema are unchanged; nothing is deleted.
+- New read-only operation `ha.query.read` (target `ha:query`): questions such as "Which lights are on?", "What is the
+  temperature in the kitchen?", "Are any doors open?", "Is the front door locked?" or "Is the mower mowing?" are
+  compiled by GAOP code into a validated spec (allowlisted domains, at most 20 rows, safe fields only) and answered with
+  one GAOP-generated template rendered by Home Assistant's read-only `POST /api/template`. Same proposal, ChatGPT check,
+  owner Authorize, Claude bound intent, deterministic verification, ChatGPT review and receipt path. Unavailable
+  readings and truncation are disclosed. "Why…/investigate…" requests run as bounded read-only investigations.
+- Capability registry: one entry per allowed operation (class, executor/reviewer route, since); shown read-only on
+  System & Maintenance. Change requests without a registered capability are refused with nothing created. Routes for
+  new requests come from the registry; a missing executor route is refused up front (no silent fallback).
+- Fix: a failed read-only template request is not treated as a possible write.
+- No new connector, credential, permission (config.yaml permissions unchanged), service call or household write.
+- Verification: selftest 273/273 (two exact-capability pins amended to the new set); DAI-533 24/24;
+  DAI-536 22/22 in gaop/tests/test_dai536_functional.py.
+
 ## 0.8.13 (DAI-IN-533/534 pending-proposal expiry, separate owner approval window, Dashboard refresh)
 - Pending proposals that were never authorised now expire with the existing EXPIRED terminal state, including a
   residual PROPOSED record left by an owner Revise. The watchdog settles any elapsed, never-authorised pending
