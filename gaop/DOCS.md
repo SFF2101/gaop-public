@@ -1,5 +1,17 @@
 # GAOP — Governed AI Operations Platform (v0.10.x, dual-AI production build)
 
+**v0.10.2:** say it the normal way, for example "Turn off the Office light". ChatGPT works out what you mean and asks
+to look the device up first (read-only, after your Authorize); it then shows you the exact device and change to
+prepare, asks which one you mean, or explains what is not possible. Nothing changes until you Authorize the exact
+change. For an automation ("make the verandah shutter automation also close above 25 C"), ChatGPT first finds it by
+name, then asks to read its configuration (you press Continue and Authorize), then proposes the exact new
+configuration for your separate approval.
+
+**v0.10.1:** if ChatGPT's plan breaks GAOP's tool rules, GAOP tells you which call and argument was wrong and lets
+ChatGPT correct it once (the corrected plan is checked the same way; nothing runs without your Authorize). Pressing Ask
+twice no longer starts the same request twice. Earlier investigations with a change ready to prepare stay reachable on
+Home and on System & Maintenance (Recent results) even when a newer result is shown as "Latest result".
+
 **v0.10.0:** ask GAOP anything about your home ("why does the porch light keep switching off?"). ChatGPT plans a few
 read-only checks; you see them and press Authorize; GAOP reads exactly those and ChatGPT answers from what was read. If
 a change would help, it is shown as a suggestion; "Prepare this change for my approval" makes it a separate proposal
