@@ -1,14 +1,14 @@
 {
- "gaop_version": "0.10.0",
- "package_digest": "33916de8143c495080a82b0212c060d4b5c5744e0854ecb9381b31bc8c992b7e",
+ "gaop_version": "0.10.2",
+ "package_digest": "9409c46159139b274aa52e9e7c71293bcf58f051c9fe3f68094d7a5e1321d863",
  "previous_release": {
-  "gaop_version": "0.8.13",
-  "private_source_commit": "a0865f9443f5dc52e50255f221fa66f2010b4939",
-  "public_main": "69cbcef8eadba053289a75c605747631ae214639"
+  "gaop_version": "0.10.0",
+  "private_source_commit": "e94b5ef88fe8a5b1d397fc8879b4784997880221",
+  "public_main": "89a85fd8994a05b696c40ad622c35a7c0058f447"
  },
- "private_source_commit": "e94b5ef88fe8a5b1d397fc8879b4784997880221",
+ "private_source_commit": "1c50bdd8e17502c49956d9bf1122ae196a419883",
  "public_distribution_commit": "recorded after merge (see git history / release report)",
  "release_manifest": "gaop/GAOP_RELEASE.json",
- "rollback_target": "public commit 69cbcef8eadba053289a75c605747631ae214639 (GAOP 0.8.13); accepted baseline 0.8.8 = 1a965c2a2ca1f4084a111b744c849ef905fb6478",
+ "rollback_target": "public commit 89a85fd8994a05b696c40ad622c35a7c0058f447 (GAOP 0.10.0, package digest 33916de8143c495080a82b0212c060d4b5c5744e0854ecb9381b31bc8c992b7e)",
  "schema": "gaop.publication.v1"
 }

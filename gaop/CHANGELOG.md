@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.10.2 (DAI-IN-550/551; development candidate, not deployed; includes 0.10.1)
+- Everyday requests are understood by ChatGPT, not by GAOP. "Turn off the Office light", questions and complex
+  automation requests all go, in your own words, to the OpenAI planner, which says what it understood, plans the
+  read-only checks needed to find the exact device (or automation and its current configuration), or asks a short
+  question, or explains specifically what is not possible. GAOP itself has no household-language rules on this path;
+  it only checks the plan against its allowlist, runs it after your Authorize, and keeps state, budgets and receipts.
+- After the checks, ChatGPT chooses the exact target from what Home Assistant actually returned (or lists the
+  candidates and asks which one). GAOP refuses any suggested target that was not actually seen in that evidence, so an
+  ID can never be invented; the change then needs Prepare, ChatGPT's check of the exact change and your Authorize, and
+  Claude carries it out with read-back.
+- Planner replies that are not readable JSON get the same single correction as refused plans (at most one correction in
+  total per request); the planner is shown a valid lookup example and told never to guess entity IDs. Refusals name the
+  exact field (for example "MALFORMED: query match").
+- The duplicate-Ask guard ignores case, spacing and final punctuation. The "what can GAOP change" text is now truthful.
+- DAI-IN-552: automations can be found by their real name or area (the read-only lookup may now include automations;
+  each automation row carries the configuration id Home Assistant itself reports). After a first investigation,
+  ChatGPT may ask for ONE follow-up set of read-only checks (for example "read the configuration of the automation I
+  found"), using only ids that appeared in that evidence. You see exactly what will be read and approve it with its own
+  Authorize ("Continue"); it is linked to the first investigation and bound to its exact evidence, and it cannot ask
+  for another follow-up. Any change ChatGPT then designs still needs Prepare, ChatGPT's check and your Authorize.
+
+## 0.10.1 (DAI-IN-549 usability fixes; development candidate, not deployed)
+- Refused plans are explained: when ChatGPT's investigation plan breaks GAOP's tool rules, GAOP still refuses it and
+  makes no Home Assistant call, but now says which call and which argument was wrong (and what the tool accepts). GAOP
+  asks ChatGPT once, and only once, to correct the plan using exactly that explanation; the corrected plan goes through
+  the same validator and allowlist. A second refusal stops with both explanations and creates nothing. Both planner
+  calls count against the investigation's existing budget; authority, packages and the tool table are unchanged.
+- No accidental duplicates: the Ask and Prepare-change buttons submit once per click, and GAOP refuses an identical
+  Ask that is still being prepared, or that was created in the last 60 seconds and has not been acted on. Different
+  requests, and repeating a request after the earlier one finished or after you acted on it, work as before.
+- Prepare-change stays reachable: if a newer result (for example a rejected request) replaces an investigation as the
+  Home page's "Latest result", earlier investigations with a change ready to prepare are listed on Home, and System &
+  Maintenance shows a Prepare change button on their Recent results row. Same eligibility as before (completed
+  investigation, validated suggestion, not yet prepared); the prepared change still needs its own check and Authorize.
+
 ## 0.10.0 (DAI-IN-537 governed tool orchestration; development candidate, not deployed)
 - New `ha.investigate` (read-only): for requests other than the fixed sun/test-switch paths, ChatGPT plans up to 6
   read-only tool calls (state, template query, history, logbook, automation configuration). You see the plan and press
