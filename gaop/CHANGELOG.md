@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.0 (DAI-IN-561; development candidate, not deployed)
+- General-purpose clarification workspace. When ChatGPT asks the owner a question (before planning, or after an
+  investigation that found several candidates), GAOP opens ONE durable, owner-bound conversation instead of treating
+  the next answer as a new, context-free request. The Home page shows it as a panel (modal on desktop, full-width on
+  mobile) only while it is open: original request, ordered messages, outstanding ambiguities, and the rows already read
+  from Home Assistant; Send answer, Cancel request, Not now.
+- Every answer sends the complete relevant context explicitly to the approved OpenAI designer route (original request,
+  all messages in order, ambiguities, already-read evidence rows), bounded to 8 KiB with any omission stated; provider
+  conversation memory is never relied on. Limits: 4 answers, 30 minutes absolute lifetime, 300 characters per message.
+- Resolution only creates a proposal through the existing controls: a read-only investigation (same planner validator,
+  single re-plan, ChatGPT check, owner Authorize), or - when the answer picks a target from evidence already read - a
+  change prepared exactly like "Prepare this change" (evidence-bound target, automation freshness binding, ChatGPT
+  check, owner Authorize). No answer, including "yes", is ever authority; authority claims in answers are refused.
+- Fail closed: cancel, expiry, the answer limit, a provider failure and a refused suggestion create nothing. A target
+  not in the evidence, last seen unavailable/unknown, evidence that no longer matches its bound hash, or an already
+  prepared change is refused. An answer left pending by a restart is marked failed and never re-sent. A newer request
+  supersedes (cancels) an older open conversation.
+- Sessions are stored App-private in /data (gaop/clar/, CAS writes with literal read-back), bound to the owner identity
+  hash. Clarification text is display/provenance only: it is not part of any proposal, package, digest or receipt.
+- Clear, unambiguous requests and the fixed sun/test-switch paths behave exactly as before.
+
 ## 0.10.2 (DAI-IN-550/551; development candidate, not deployed; includes 0.10.1)
 - Everyday requests are understood by ChatGPT, not by GAOP. "Turn off the Office light", questions and complex
   automation requests all go, in your own words, to the OpenAI planner, which says what it understood, plans the

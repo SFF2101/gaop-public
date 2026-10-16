@@ -1,23 +1,23 @@
 {
- "build_timestamp": "2026-10-14T11:33:02Z",
- "gaop_version": "0.10.2",
- "package_digest": "9409c46159139b274aa52e9e7c71293bcf58f051c9fe3f68094d7a5e1321d863",
+ "build_timestamp": "2026-10-16T11:27:46Z",
+ "gaop_version": "0.11.0",
+ "package_digest": "5a42a1c4eb9556ae56467c1ad3f736622c82edc0165d240d3705b54da462003e",
  "package_files": {
-  "CHANGELOG.md": "df14737d4b45e19f333fcb7ff3ff13358aa3fcae85a60ed517d472ccb114aa78",
-  "DOCS.md": "ad5d6d8ab2ce97124cf9764a68dfb7cec6e51240f99c5864adbd937e7f3cfbf5",
+  "CHANGELOG.md": "3a320d767c72424b576ed3845a140519dadea39b3907d480197b5b8ad882ee12",
+  "DOCS.md": "ebd05524bc36081c8cc9ee57f9a298cf527e57ec50ca6aae7cdd8a3ce5bf939d",
   "Dockerfile": "1d0a005de9f6a2ac23d7b25f6003aa228742c366de1b06cf4819cda852a9b120",
   "README.md": "b4920cc20c336b96918b38f14ba29bbe2985476067385cf6bb4e8594b0ba75e1",
   "apparmor.txt": "91a46beb74ddf87ba666ab502ee4f18f848a1f47a18634487ea410a1a7a68add",
-  "config.yaml": "3f7419ad8ba52a7b8e95e975468a8debcf7ba8f4c4798fcc52560b40a621b225",
-  "gaop_core.py": "951c1283c0eb4d50d4ec834b70cc629c6ebeeb77943b555bbf49115ed9497d87",
+  "config.yaml": "b691b2910f2f5fae80d0695fffc2b6d67693daddfd36071ae623dce0de159eb0",
+  "gaop_core.py": "2ce72b70c35b12d3a010d4c08d3b918769f17521eac8281f68b2642bd896ee74",
   "run.sh": "f775e53ba186bb0886d232e7f1d1211d649ef3d86dbeb46db53b004126933ad4"
  },
  "package_schema": "gaop.distribution.v1",
- "private_source_commit": "1c50bdd8e17502c49956d9bf1122ae196a419883",
+ "private_source_commit": "75184de22dca6bc1a3c3d79de74d7adf0dd2a3b5",
  "private_source_repo": "SFF2101/home-assistant-gaop",
  "public_distribution_commit": "recorded in PUBLICATION.json after publication",
  "runtime_files": {
-  "gaop_core.py": "951c1283c0eb4d50d4ec834b70cc629c6ebeeb77943b555bbf49115ed9497d87",
+  "gaop_core.py": "2ce72b70c35b12d3a010d4c08d3b918769f17521eac8281f68b2642bd896ee74",
   "run.sh": "f775e53ba186bb0886d232e7f1d1211d649ef3d86dbeb46db53b004126933ad4"
  },
  "schema": "gaop.release.v1"

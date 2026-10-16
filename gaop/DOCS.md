@@ -1,4 +1,11 @@
-# GAOP — Governed AI Operations Platform (v0.10.x, dual-AI production build)
+# GAOP — Governed AI Operations Platform (v0.11.x, dual-AI production build)
+
+**v0.11.0:** when ChatGPT needs more detail ("Which entrance light: the ceiling light or the wall light?"), a small
+conversation panel opens on the Home page. It keeps your original request, every question and answer, what is still
+unclear and what was already found in Home Assistant, so a short answer such as "ceiling light", "that one" or "yes"
+is understood in context. It survives a page refresh and an App restart; "Not now" keeps it for later, "Cancel
+request" drops it. Answering never approves anything: the result is a normal proposal that ChatGPT checks and that
+changes nothing until you press Authorize. Conversations end after 4 answers or 30 minutes.
 
 **v0.10.2:** say it the normal way, for example "Turn off the Office light". ChatGPT works out what you mean and asks
 to look the device up first (read-only, after your Authorize); it then shows you the exact device and change to
