@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time, types
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.11.1"
+VERSION = "0.11.2"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -1012,7 +1012,7 @@ def check_follow_up_in_evidence(calls, evidence):
     return calls
 
 
-def review_findings(o, meta=None, evidence=None, stage=None):
+def review_findings(o, meta=None, evidence=None, stage=None, change_request=False):
     """DAI-IN-537: the reviewer's answer and optional suggested change, validated by GAOP. An invalid suggestion is
     dropped (never repaired) and the reason recorded; a suggestion never executes without a new owner Authorize.
     DAI-IN-551: when the evidence is given, every suggested target must have been observed in it.
@@ -1047,7 +1047,40 @@ def review_findings(o, meta=None, evidence=None, stage=None):
     if clar and not calls and not out.get("follow_up"):
         out["clarify"] = clar
         out["ambiguities"] = clarify_list(o.get("ambiguities"))
+    # DAI-IN-577: an implementation request must not finish at a narrative-only "next step". It ends in exactly one
+    # explicit continuation: a validated change (A), a follow-up or question (B), a stated blocker (C), or - when none
+    # of these was returned - CHANGE_NOT_PROPOSED, which GAOP turns into a kept, evidence-bound conversation (B).
+    # Text is never converted into a change; a read-only question keeps ending as ANSWERED.
+    is_change = bool(change_request) or o.get("request_kind") == "change"
+    out["change_request"] = is_change
+    blocked = clarify_line(o.get("blocked"))
+    if calls:
+        out["continuation"] = "CHANGE_SUGGESTED"
+    elif out.get("follow_up"):
+        out["continuation"] = "FOLLOW_UP"
+    elif out.get("clarify"):
+        out["continuation"] = "CLARIFY"
+    elif is_change and blocked:
+        out["continuation"], out["blocked"] = "BLOCKED", blocked
+    elif is_change:
+        out["continuation"] = "CHANGE_NOT_PROPOSED"
+    else:
+        out["continuation"] = "ANSWERED"
     return out
+
+
+def asks_for_change(text):
+    """DAI-IN-577 (deterministic, conservative): the owner's own words start with a change verb ("create ...",
+    "turn off ...", "automate ..."). Used only to require an explicit continuation; never authority."""
+    return bool(ASK_WRITE_LEAD_RE.match(clean_ask_text(text).lower()))
+
+
+def change_continuation_note(fd):
+    """DAI-IN-577: GAOP's own note opening the kept conversation after a change request got no exact change."""
+    why = (" (%s)" % fd["note"][:160]) if fd.get("note") else ""
+    return clarify_line("ChatGPT answered but did not propose an exact change that GAOP can check%s, so nothing is "
+                        "ready to approve and nothing was changed. Add a detail (which device, what should happen and "
+                        "when) and ChatGPT will try again using what was already read, or cancel." % why)
 
 
 def investigation_stage(params):
@@ -1560,8 +1593,9 @@ CLARIFY_PLANNER_TEXT = (
     'return a plan as usual and also "resolved_request": the complete request restated in plain words (<=300 chars). '
     'Always include the "plan" key. ')
 CLARIFY_PLANNER_GAOP_TEXT = (       # DAI-IN-568: only when the conversation contains a GAOP note
-    'A message with role "gaop" is GAOP (not the owner) explaining why your previous plan for this request could not '
-    'be used; your next plan must satisfy it exactly (PAYLOAD.query_spec and PAYLOAD.read_tools). ')
+    'A message with role "gaop" is GAOP (not the owner) explaining why your previous plan or answer for this request '
+    'could not be used; your next reply must satisfy it exactly (PAYLOAD.query_spec, PAYLOAD.read_tools and, when '
+    'present, PAYLOAD.change_tools). ')
 PLAN_RECOVERY_SUFFIX = (" Your request is kept: you can add a detail or rephrase it in the conversation panel and I "
                         "will ask ChatGPT again with your original request, or cancel it.")
 
@@ -2333,7 +2367,14 @@ def review_prompt(kind, payload):
                 # DAI-IN-561: a question to the owner opens GAOP's clarification conversation
                 + ' If you cannot answer or design the change without a decision from the owner (for example which '
                 'of several candidates), also return "clarify": that one short question (<=300 chars) and '
-                '"ambiguities": up to 5 short strings naming what is still unclear; suggest no change in that case.')
+                '"ambiguities": up to 5 short strings naming what is still unclear; suggest no change in that case.'
+                # DAI-IN-577: an implementation request needs an actionable continuation, never narrative only
+                + ' Also return "request_kind": "change" if PAYLOAD.parameters.question asks for something to be '
+                'changed, created, automated or set up in Home Assistant, otherwise "question". For a change request '
+                'return exactly one of: suggested_change, follow_up, clarify, or "blocked": one plain sentence (<=300 '
+                'chars) saying specifically why no exact change can be proposed with PAYLOAD.change_tools. Never '
+                'answer a change request only with a narrative next step such as "propose the automation": GAOP cannot '
+                'act on narrative text.')
     if payload.get("technical_evidence"):
         # DAI-IN-527: appended only when verified evidence is bound (prompts without evidence are unchanged)
         ask += (' PAYLOAD.technical_evidence was verified by GAOP code before this call: each excerpt is the exact text '
@@ -3444,8 +3485,12 @@ class Engine:
         ev = list((res.get("result") or {}).get("evidence") or [])
         if investigation_stage(rec["exec_package"]["parameters"]) == 2:
             ev = self._prior_evidence(rec) + ev
-        sess = self._clar_open(rec.get("ask_text") or rec["proposal"]["value"]["question"], fd["clarify"],
-                               fd.get("ambiguities"), source=(rec["txn_id"], res.get("result_sha256"), ev))
+        if fd.get("clarify"):
+            question, role = fd["clarify"], "chatgpt"
+        else:                                             # DAI-IN-577: CHANGE_NOT_PROPOSED -> GAOP's own note
+            question, role = change_continuation_note(fd), "gaop"
+        sess = self._clar_open(rec.get("ask_text") or rec["proposal"]["value"]["question"], question,
+                               fd.get("ambiguities"), source=(rec["txn_id"], res.get("result_sha256"), ev), role=role)
         return sess
 
     def _clar_load(self, sid, remote_user_id):
@@ -4287,13 +4332,17 @@ class Engine:
                 ev = list(((rec.get("result") or {}).get("result") or {}).get("evidence") or [])
                 if stage == 2:                                      # DAI-IN-552: + bound first-stage evidence
                     ev = self._prior_evidence(rec) + ev
-                rec["findings"] = review_findings(o, meta, evidence=ev, stage=stage)  # answer + optional exact change
+                asked = rec.get("ask_text") or ((rec.get("proposal") or {}).get("value") or {}).get("question")
+                rec["findings"] = review_findings(o, meta, evidence=ev, stage=stage,      # answer + optional exact change
+                                                  change_request=asks_for_change(asked))   # DAI-IN-577
             if prior and prior["kind"] == "DISAGREE_VERIFICATION":
                 prior["outcome"] = "RESOLVED_NO_MATERIAL_CHANGE"
             self.s.put(rec, v)
             out = self._closeout(rec["txn_id"])
-            if (rec.get("findings") or {}).get("clarify"):
+            fdx = rec.get("findings") or {}
+            if fdx.get("clarify") or fdx.get("continuation") == "CHANGE_NOT_PROPOSED":
                 # DAI-IN-561: ChatGPT asked the owner a question about this evidence -> clarification session
+                # DAI-IN-577: a change request with no exact change keeps the request + evidence in that same session
                 # (context only; a failure here never affects the investigation's own outcome)
                 try:
                     done = self.s.get(rec["txn_id"])
@@ -5235,8 +5284,17 @@ def investigation_html(rec, v, owner, base):
     fd = rec.get("findings") or {}
     ev = (v.get("result") or {}).get("evidence") or []
     errs = [e for e in ev if e.get("status") != "OK"]
-    out = ["<p>Completed. ChatGPT's answer, from the evidence GAOP read:</p><p>%s</p>"
-           % esc(fd.get("text") or "No answer text was returned.")]
+    cont = fd.get("continuation")                         # DAI-IN-577 (absent on older records: unchanged display)
+    lead = "Read-only investigation completed" if cont in ("BLOCKED", "CHANGE_NOT_PROPOSED") else "Completed"
+    out = ["<p>%s. ChatGPT's answer, from the evidence GAOP read:</p><p>%s</p>"
+           % (lead, esc(fd.get("text") or "No answer text was returned."))]
+    if cont == "BLOCKED":
+        out.append('<p class="n">No change can be proposed for this request: %s Nothing was changed.</p>'
+                   % esc(fd.get("blocked")))
+    elif cont == "CHANGE_NOT_PROPOSED":
+        out.append('<p class="n">You asked for a change, but ChatGPT did not propose an exact change GAOP can check, so '
+                   'nothing is ready to approve and nothing was changed. Your request is kept in the conversation '
+                   'panel: add a detail and ChatGPT will try again using what was already read, or cancel it.</p>')
     out.append('<p class="st">Evidence: %d read-only check(s)%s.</p>'
                % (len(ev), ("; %d could not be read" % len(errs)) if errs else ""))
     sc = fd.get("suggested_change") or []
