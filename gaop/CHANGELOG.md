@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.2 (DAI-IN-577; development candidate, not deployed)
+- Investigation-to-implementation continuity. When you ask for a change and ChatGPT's investigation answers only with
+  a narrative "next step" (no exact change GAOP can check), GAOP no longer finishes as if the request were done. The
+  result says plainly that nothing is ready to approve and nothing was changed, and your request is kept in the
+  conversation panel together with the evidence already read: add a detail and ChatGPT tries again from that
+  evidence (any resulting change goes through the unchanged Prepare/check/Authorize controls), or cancel.
+- ChatGPT is now asked to say whether a request is a change or a question and, for a change, to return exactly one of:
+  an exact suggested change, further read-only checks, a question for you, or a specific reason why no change can be
+  proposed ("blocked"), which is shown as such. Narrative text is never turned into a change.
+- A change request is also recognised from your own words when they start with a change verb ("create", "turn off",
+  "automate", ...). Read-only questions still complete normally. No new permissions, no automatic approval.
+
 ## 0.11.1 (DAI-IN-568; development candidate, not deployed)
 - Planning robustness: when ChatGPT's read-only lookup lists only supported domains but in a different order or with
   a duplicate (for example ["light", "cover"]), GAOP now puts them in the required order before its unchanged strict
