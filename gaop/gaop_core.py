@@ -23,7 +23,7 @@ import fcntl, hashlib, html, json, os, re, secrets, sys, threading, time, types
 import urllib.error, urllib.parse, urllib.request, ssl, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 PROTOCOL = "gaop.control.v1"
 STORE_SCHEMA = 1                      # gaop.store.v1 — defined from first principles (no POC migration)
 MAX_ENVELOPE_BYTES = 4096
@@ -485,11 +485,17 @@ def validate_query_spec(q, domains=QUERY_DOMAINS):
     if not isinstance(q, dict) or set(q) != QUERY_SPEC_KEYS:
         raise Denied("MALFORMED", "query spec fields")
     d, dc = q["domains"], q["device_classes"]
-    if (not isinstance(d, list) or not 1 <= len(d) <= len(domains) or d != sorted(set(d))
-            or any(x not in domains for x in d)):
-        raise Denied("MALFORMED", "query domains")
-    if (not isinstance(dc, list) or len(dc) > 6 or dc != sorted(set(dc))
-            or any(not isinstance(x, str) or not QUERY_TOKEN_RE.match(x) for x in dc)):
+    # DAI-IN-568: element types are checked BEFORE ordering (a mixed-type list used to raise TypeError instead of a
+    # clean refusal), and the refusal says which rule failed so the planner's single correction is actionable.
+    if not isinstance(d, list) or not d or any(not isinstance(x, str) for x in d):
+        raise Denied("MALFORMED", "query domains: must be a non-empty list of domain names")
+    bad = sorted({x for x in d if x not in domains})
+    if bad:
+        raise Denied("MALFORMED", "query domains: not allowed: %s" % ", ".join(x[:24] for x in bad[:4]))
+    if len(d) > len(domains) or d != sorted(set(d)):
+        raise Denied("MALFORMED", "query domains: must be sorted and unique")
+    if (not isinstance(dc, list) or len(dc) > 6
+            or any(not isinstance(x, str) or not QUERY_TOKEN_RE.match(x) for x in dc) or dc != sorted(set(dc))):
         raise Denied("MALFORMED", "query device_classes")
     if not isinstance(q["match"], str) or (q["match"] and not QUERY_MATCH_RE.match(q["match"])):
         raise Denied("MALFORMED", "query match")
@@ -729,6 +735,27 @@ def validate_tool_calls(calls, kinds, n_max, suggestion=False):
 
 
 SAFE_DETAIL_RE = re.compile(r"[^A-Za-z0-9 _.,:;=()/+-]")
+
+
+def canonical_plan_domains(raw):
+    """DAI-IN-568: harmless formatting only. For a states.query call whose "domains" is a non-empty list in which EVERY
+    entry is a supported query-domain string, return the list sorted and de-duplicated (the exact form the strict
+    validator requires). Nothing else is touched: unsupported, empty, non-string or non-list values are left as they
+    are and are refused by the unchanged validator; no domain is ever added or dropped, no other field changes.
+    Returns (calls, [1-based indices of canonicalised calls]); the input is not modified."""
+    if not isinstance(raw, list):
+        return raw, []
+    out, fixed = [], []
+    for i, c in enumerate(raw):
+        a = c.get("args") if isinstance(c, dict) and c.get("tool") == "states.query" else None
+        q = a.get("query") if isinstance(a, dict) else None
+        d = q.get("domains") if isinstance(q, dict) else None
+        if (isinstance(d, list) and d and all(isinstance(x, str) and x in TOOL_QUERY_DOMAINS for x in d)
+                and d != sorted(set(d))):
+            c = dict(c, args=dict(a, query=dict(q, domains=sorted(set(d)))))
+            fixed.append(i + 1)
+        out.append(c)
+    return out, fixed
 
 
 def plan_refusal_detail(raw, d, kinds=frozenset({"read"}), n_max=PLAN_MAX_CALLS):
@@ -1011,7 +1038,7 @@ def review_findings(o, meta=None, evidence=None, stage=None):
         else:
             try:
                 out["follow_up"] = check_follow_up_in_evidence(
-                    validate_tool_calls(fu, {"read"}, PLAN_MAX_CALLS), evidence or [])
+                    validate_tool_calls(canonical_plan_domains(fu)[0], {"read"}, PLAN_MAX_CALLS), evidence or [])
                 out["follow_up_reason"] = re.sub(r"[\x00-\x1f\x7f]+", " ", str(o.get("follow_up_reason") or ""))[:300]
             except Denied as d:
                 out["follow_up_note"] = "follow-up refused by GAOP: %s %s" % (d.code, d.detail[:160])
@@ -1532,6 +1559,19 @@ CLARIFY_PLANNER_TEXT = (
     '{"plan":[],"clarify":"one short question","ambiguities":["what is still unclear"]}). Once the request is clear, '
     'return a plan as usual and also "resolved_request": the complete request restated in plain words (<=300 chars). '
     'Always include the "plan" key. ')
+CLARIFY_PLANNER_GAOP_TEXT = (       # DAI-IN-568: only when the conversation contains a GAOP note
+    'A message with role "gaop" is GAOP (not the owner) explaining why your previous plan for this request could not '
+    'be used; your next plan must satisfy it exactly (PAYLOAD.query_spec and PAYLOAD.read_tools). ')
+PLAN_RECOVERY_SUFFIX = (" Your request is kept: you can add a detail or rephrase it in the conversation panel and I "
+                        "will ask ChatGPT again with your original request, or cancel it.")
+
+
+def plan_recovery_note(why):
+    """DAI-IN-568: GAOP's own note shown in the conversation and sent as context with the owner's next answer."""
+    return clarify_line("ChatGPT's plan could not be used: %s. Nothing was read or changed. Add a detail or rephrase "
+                        "your request, or cancel." % SAFE_DETAIL_RE.sub("", str(why))[:200])
+
+
 CLARIFY_PLANNER_EVIDENCE_TEXT = (
     'clarification.known_evidence.rows were ALREADY read from Home Assistant by investigation '
     'clarification.known_evidence.source_txn (e=entity id, n=name, s=state, a=area, i=automation configuration id); '
@@ -3215,6 +3255,8 @@ class Engine:
                      'PAYLOAD.validation_feedback; return a corrected plan that satisfies it exactly, or an empty plan. '
                      if feedback else '')
                   + (CLARIFY_PLANNER_TEXT if clarification else '')
+                  + (CLARIFY_PLANNER_GAOP_TEXT if clarification and any(
+                      m.get("role") == "gaop" for m in clarification.get("conversation") or []) else '')
                   + (CLARIFY_PLANNER_EVIDENCE_TEXT if with_evidence else '')
                   + 'PAYLOAD=' + json.dumps(payload, sort_keys=True, separators=(",", ":")))
         resp = provider_request("openai-api", cred, PLANNER_SYSTEM, prompt, self.transport or http_transport,
@@ -3238,11 +3280,21 @@ class Engine:
                     "is not set up. Nothing was created." % ", ".join(missing or ["openai-api"])}
         out = self._plan_and_propose(t, lambda fb: self._planner_call(t, feedback=fb), ex, rv)
         clar, amb = out.pop("_clarify", None), out.pop("_ambiguities", None)
+        bad = out.pop("_plan_invalid", None)
         out.pop("_meta", None)
         if clar:
             try:
                 out["session_id"] = self._clar_open(t, clar, amb)["session_id"]
             except Exception as ex2:                     # the reply is still shown; nothing is created either way
+                log("CLARIFY open failed class=%s" % type(ex2).__name__)
+        elif bad:
+            # DAI-IN-568: a technically invalid plan (after the single correction) keeps the owner's request in the
+            # existing clarification workflow; the owner may add detail/rephrase (each answer = one bounded planning
+            # attempt, within the existing answer limit) or cancel. No proposal, no HA call, no extra provider retry.
+            try:
+                out["session_id"] = self._clar_open(t, plan_recovery_note(bad), role="gaop")["session_id"]
+                out["message"] += PLAN_RECOVERY_SUFFIX
+            except Exception as ex2:
                 log("CLARIFY open failed class=%s" % type(ex2).__name__)
         return out
 
@@ -3270,7 +3322,8 @@ class Engine:
             except ProviderError as pe2:
                 return {"outcome": "UNAVAILABLE", "code": pe2.kind, "message": "ChatGPT's reply could not be read "
                         "(%s). I asked once for a corrected reply and that could not be used either (%s). Nothing was "
-                        "created and nothing in your home was read or changed." % (first, pe2.kind)}
+                        "created and nothing in your home was read or changed." % (first, pe2.kind),
+                        "_plan_invalid": "ChatGPT's reply could not be read twice (%s)" % pe2.kind}
             replan = {"first_refusal": first, "response_id": meta.get("response_id")}
             meta = dict(meta, calls=2, replan=replan)
         if intercept is not None:
@@ -3278,17 +3331,22 @@ class Engine:
             if early is not None:
                 return early
         for attempt in ((2,) if replan else (1, 2)):
+            raw, fixed = canonical_plan_domains(obj.get("plan"))    # DAI-IN-568: harmless ordering/duplicates only
             try:
-                plan = validate_tool_calls(obj.get("plan"), {"read"}, PLAN_MAX_CALLS) if obj.get("plan") else []
+                plan = validate_tool_calls(raw, {"read"}, PLAN_MAX_CALLS) if obj.get("plan") else []
+                if fixed:
+                    log("PLAN domains canonicalised (attempt %d): calls %s" % (attempt, fixed))
+                    meta = dict(meta, domains_canonicalised=fixed)
                 break
             except Denied as d:
-                why = plan_refusal_detail(obj.get("plan"), d)
+                why = plan_refusal_detail(raw, d)
                 log("PLAN refused (attempt %d): %s" % (attempt, why))
                 if attempt == 2:
                     return {"outcome": "UNSUPPORTED", "code": d.code, "message": "ChatGPT's first plan could not be "
                             "used (%s), so I did not use it. I asked ChatGPT once to correct it; the corrected "
                             "plan was also refused (%s). Nothing was created and nothing in your home was read or "
-                            "changed. You could rephrase the request more specifically." % (first, why)}
+                            "changed. You could rephrase the request more specifically." % (first, why),
+                            "_plan_invalid": "ChatGPT's plan was refused twice (%s)" % why}
                 first = why
                 try:
                     obj2, meta2 = call(why)
@@ -3351,9 +3409,10 @@ class Engine:
         self.s.unlock()
         self._clar_guard.release()
 
-    def _clar_open(self, original, question, ambiguities=None, source=None):
+    def _clar_open(self, original, question, ambiguities=None, source=None, role="chatgpt"):
         """Create one OPEN session (any other OPEN session of the owner is superseded: CANCELLED, nothing done).
-        source: (txn_id, result_sha256, evidence) of the investigation whose evidence may be reused."""
+        source: (txn_id, result_sha256, evidence) of the investigation whose evidence may be reused.
+        DAI-IN-568: role "gaop" opens it with GAOP's own note that ChatGPT's plan could not be used (recovery)."""
         at = self.clock()
         self._clar_lock()
         try:
@@ -3366,7 +3425,7 @@ class Engine:
             sess = {"session_id": sid, "schema": 1, "owner_ref": OWNER_PIN, "state": "OPEN", "created": at,
                     "updated": at, "expires_at": at + CLARIFY_TTL_S, "original_request": clarify_line(original, ASK_MAX_CHARS),
                     "messages": [{"role": "owner", "text": clarify_line(original, ASK_MAX_CHARS), "at": at},
-                                 {"role": "chatgpt", "text": clarify_line(question), "at": at}],
+                                 {"role": role, "text": clarify_line(question), "at": at}],
                     "ambiguities": clarify_list(ambiguities), "evidence": None, "resolved_txn": None, "outcome": None}
             if source:
                 txn_id, rsha, ev = source
@@ -3491,7 +3550,8 @@ class Engine:
         finally:
             self._clar_unlock()
 
-    def _clar_finish(self, sid, state, *, outcome, reason="", txn=None, chatgpt=None, ambiguities=None, fail_last=None):
+    def _clar_finish(self, sid, state, *, outcome, reason="", txn=None, chatgpt=None, ambiguities=None, fail_last=None,
+                     note=None):
         """Single CAS update after a turn: answer the pending owner message, optionally add ChatGPT's next question,
         and move to the next state. DAI-IN-562: applies only while this turn is still live (OPEN, or RESOLVING after
         its own claim, with its answer still pending); otherwise the reply is only recorded as discarded - a closed
@@ -3511,6 +3571,8 @@ class Engine:
             if live:
                 if chatgpt:
                     sess["messages"].append({"role": "chatgpt", "text": clarify_line(chatgpt), "at": at})
+                if note:                                      # DAI-IN-568: GAOP's own explanation (not ChatGPT's)
+                    sess["messages"].append({"role": "gaop", "text": clarify_line(note), "at": at})
                 if ambiguities is not None:
                     sess["ambiguities"] = clarify_list(ambiguities)
                 sess["state"] = state
@@ -3609,6 +3671,7 @@ class Engine:
             return out
         clar = out.pop("_clarify", None)
         amb = out.pop("_ambiguities", None)
+        bad = out.pop("_plan_invalid", None)
         out.pop("_meta", None)
         if out.get("outcome") == "DISCARDED":
             self._clar_finish(session_id, "OPEN", outcome="DISCARDED")          # records the discard only
@@ -3626,6 +3689,12 @@ class Engine:
             out = {"outcome": "UNSUPPORTED", "message": "ChatGPT still needs more detail after %d answers, so I stopped "
                    "this conversation. Nothing was created. Please ask again with the details in one message."
                    % CLARIFY_MAX_OWNER_TURNS}
+        elif bad and not last_turn:
+            # DAI-IN-568: the answer reached ChatGPT but its plan was technically invalid twice; keep the conversation
+            if self._clar_finish(session_id, "OPEN", outcome="PLAN_REFUSED", note=plan_recovery_note(bad)):
+                out["message"] += PLAN_RECOVERY_SUFFIX
+            else:
+                out = dict(CLARIFY_DISCARDED)
         elif out.get("outcome") == "UNAVAILABLE":
             # provider/route failure: this answer is marked failed (never re-sent); the owner may answer again
             self._clar_finish(session_id, "CLOSED" if last_turn else "OPEN", outcome="PROVIDER_FAILED",
@@ -5620,11 +5689,13 @@ class Handler(BaseHTTPRequestHandler):
         used = sum(1 for m in sess["messages"][1:] if m["role"] == "owner")
         msgs = []
         for i, m in enumerate(sess["messages"]):
-            who = "You" if m["role"] == "owner" else "ChatGPT"
+            who = {"owner": "You", "gaop": "GAOP"}.get(m["role"], "ChatGPT")
             tag = " (your request)" if i == 0 else (" — not answered; you can send it again" if m.get("status") == "failed"
                                                     else "")
             msgs.append('<div class="msg m-%s"><span class="st">%s%s</span><br>%s</div>'
                         % ("owner" if m["role"] == "owner" else "chatgpt", who, esc(tag), esc(m["text"])))
+        title = ("ChatGPT's plan could not be used" if sess["messages"][-1]["role"] == "gaop"
+                 else "ChatGPT needs a little more detail")                  # DAI-IN-568
         amb = sess.get("ambiguities") or []
         amb_html = ('<p class="st">Still unclear:</p><ul>%s</ul>' % "".join("<li>%s</li>" % esc(a) for a in amb)) if amb else ""
         rows = ((sess.get("evidence") or {}).get("rows") or [])[:10]
@@ -5639,7 +5710,7 @@ class Handler(BaseHTTPRequestHandler):
         left = CLARIFY_MAX_OWNER_TURNS - used
         mins = max(0, int((sess["expires_at"] - self.engine.clock()) // 60))
         return ('<div class="clarbg" role="dialog" aria-modal="true" aria-labelledby="clar-h"><div class="clar">'
-                '<h3 id="clar-h">ChatGPT needs a little more detail</h3>%s%s%s%s'
+                '<h3 id="clar-h">%s</h3>%s%s%s%s'
                 '<form method="post" action="%s/clarify/reply" onsubmit="%s"><input type="hidden" name="session_id" '
                 'value="%s"><input type="hidden" name="turn" value="%d"><textarea name="text" rows="2" maxlength="%d" '
                 'placeholder="Your answer" autofocus></textarea><button class="go">Send answer</button></form>'
@@ -5647,7 +5718,7 @@ class Handler(BaseHTTPRequestHandler):
                 'name="session_id" value="%s"><button>Cancel request</button></form> <a href="%s/?later=1">Not now</a>'
                 '<p class="st">%d answer%s left · expires in about %d min. Answering here never approves anything: '
                 'nothing in your home changes until you press Authorize on a proposal.</p></div></div>'
-                % (note, "".join(msgs), amb_html, ev_html, base, SUBMIT_ONCE_JS, sid, used, CLARIFY_TEXT_MAX,
+                % (esc(title), note, "".join(msgs), amb_html, ev_html, base, SUBMIT_ONCE_JS, sid, used, CLARIFY_TEXT_MAX,
                    base, sid, base, left, "" if left == 1 else "s", mins))
 
     def _home(self, owner, notice="", reply=None, hide_clar=False):
