@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.1 (DAI-IN-568; development candidate, not deployed)
+- Planning robustness: when ChatGPT's read-only lookup lists only supported domains but in a different order or with
+  a duplicate (for example ["light", "cover"]), GAOP now puts them in the required order before its unchanged strict
+  check. Unsupported, empty, mistyped or missing values are still refused; nothing is ever added or dropped. A list
+  mixing names and numbers is now refused cleanly instead of causing an internal error.
+- Refusals now say which rule failed (for example "query domains: not allowed: blind"), so ChatGPT's single
+  correction gets an actionable reason.
+- If ChatGPT's plan is still technically unusable after that single correction, your request is kept in the
+  conversation panel with GAOP's explanation. You can add a detail or rephrase it (ChatGPT is asked again with your
+  original request, within the existing answer limit), or cancel. Nothing is read or changed and no proposal is made
+  until a valid plan is shown and you press Authorize; answers are never approval.
+
 ## 0.11.0 (DAI-IN-561; development candidate, not deployed)
 - General-purpose clarification workspace. When ChatGPT asks the owner a question (before planning, or after an
   investigation that found several candidates), GAOP opens ONE durable, owner-bound conversation instead of treating
