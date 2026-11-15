@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.3 (DAI-IN-661; backup-only patch)
+- Home Assistant backups now include GAOP reliably. GAOP uses Home Assistant's "cold" backup mode: during a Home
+  Assistant backup, GAOP is stopped while its data is copied and started again straight afterwards (Home Assistant
+  itself keeps running). Before, GAOP was copied while running, and a record being saved at that moment could make the
+  backup leave GAOP out (15 Nov 2026) or copy a half-written record.
+- Short-lived ".tmp" files GAOP uses while saving (gaop/*.tmp and the same pattern in the txn, seen, cred, ops, clar and
+  evidence folders) are left out of backups. Every saved record is still backed up.
+- While a backup runs, the GAOP panel is briefly unavailable. Anything in progress at that moment is handled on start
+  exactly as after any restart: nothing is re-run, and unfinished work is kept or marked for your review.
+- No change to how GAOP works, stores data, or what it is allowed to do.
+
 ## 0.11.2 (DAI-IN-577; development candidate, not deployed)
 - Investigation-to-implementation continuity. When you ask for a change and ChatGPT's investigation answers only with
   a narrative "next step" (no exact change GAOP can check), GAOP no longer finishes as if the request were done. The
