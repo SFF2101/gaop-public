@@ -1,15 +1,15 @@
 {
- "gaop_version": "0.11.2",
- "package_digest": "5118b28528d0de851ee180781c611d63eb05839fd9d1eb477a46becdccc610dd",
+ "gaop_version": "0.11.3",
+ "package_digest": "74f7e2e24401e8790b9d3fd3948404861f11b0d1f9bd08c927ece7e8b36ab0a7",
  "previous_release": {
-  "gaop_version": "0.11.1",
-  "private_source_commit": "429e4817475043b9bda61a47d82910c578ded4c3",
-  "public_main": "cb0412063d8f8225de6d2f2131d9e35f27bcdd27"
+  "gaop_version": "0.11.2",
+  "private_source_commit": "c8e7f3ab31852afc988e9815014aa828ae478f11",
+  "public_main": "47d7d47ba60e15b53bad7f45d5684fb8fb683254"
  },
- "private_source_commit": "c8e7f3ab31852afc988e9815014aa828ae478f11",
- "private_source_tree": "3948415ce3e40b0ab21d27e4da49306ede6464ec",
+ "private_source_commit": "9898ceff62b1bd7bd59fce678fe8ac3c18a0614b",
+ "private_source_tree": "9f5b9f344d20481e6712155b53e5ff4165002c97",
  "public_distribution_commit": "recorded after merge (see git history / release report)",
  "release_manifest": "gaop/GAOP_RELEASE.json",
- "rollback_target": "Owner-operated HA UI App-only restore (R1) of GAOP 0.11.1 (551cac20_gaop) from HA backup f2a12deb (2026-10-17 12:01, verified to contain 551cac20_gaop 0.11.1; owner App-only preview PASS; DAI-IN-579/580 P0); previous distribution public commit cb0412063d8f8225de6d2f2131d9e35f27bcdd27 (GAOP 0.11.1, package digest 65be62d472a2cc4655cd229616210cc0cdc602853483c4c2667a8c18c9105df5). Supervisor update cannot downgrade.",
+ "rollback_target": "Owner-operated HA UI App-only restore (R1) of GAOP 0.11.2 (551cac20_gaop) from HA backup 92b3ebb7 (2026-11-14 05:16, Google Drive, verified to contain 551cac20_gaop 0.11.2, failed_addons []; owner App-only preview PASS without restore, DAI-IN-661); previous distribution public commit 47d7d47ba60e15b53bad7f45d5684fb8fb683254 (GAOP 0.11.2, package digest 5118b28528d0de851ee180781c611d63eb05839fd9d1eb477a46becdccc610dd). Supervisor update cannot downgrade.",
  "schema": "gaop.publication.v1"
 }
